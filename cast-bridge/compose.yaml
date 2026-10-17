@@ -41,7 +41,7 @@ services:
         max-size: "5m"
         max-file: "3"
   cast-bridge:
-    image: shairport-cast-bridge:prototype-5
+    image: shairport-cast-bridge:prototype-6
     container_name: shairport-cast-bridge
     network_mode: host
     restart: unless-stopped
