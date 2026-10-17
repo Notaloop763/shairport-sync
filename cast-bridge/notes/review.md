@@ -1,18 +1,23 @@
 # Review of the cast-bridge prototype (`69c96d82`)
 
-Scope: every file under `cast-bridge/`, read in full, checked against the shairport-sync source in
-this checkout (tag `5.6`, unmodified outside `cast-bridge/`) and the PyChromecast 14.0.10 wheel
-that the `Dockerfile` pins. Source citations without a directory are shairport-sync files at the
-repo root. `pychromecast/…` paths are inside that wheel.
+Scope: every file under `cast-bridge/`, read in full, checked against the PyChromecast 14.0.10
+wheel that the `Dockerfile` pins and against the shairport-sync source on `upstream/development`
+at `380e6b1b` (5.7-dev-23), which `bridge` is built on. Source citations without a directory are
+shairport-sync files at the repo root, at that commit. `pychromecast/…` paths are inside that
+wheel. The bridge code is byte-identical to `69c96d82`, so its citations are unchanged.
+
+The review was first written against tag `5.6`, and the live stack still runs a receiver image
+built from 5.6 (`cast-bridge/compose.yaml:3`). Where receiver behaviour differs between 5.6 and
+the new base, the finding or claim says so.
 
 Local experiments (no network, no Cast device) used `bridge.py` unmodified with fake `proc` and
-fake Cast objects, in the same style as `tests/fragmented_pcm_test.py`. They become real tests
-in step 3.
+fake Cast objects, in the same style as `tests/fragmented_pcm_test.py`. They are not yet checked
+in as tests.
 
 ## Findings
 
-Ranked most severe first. "Walter's call" marks findings whose fix is a behaviour choice that
-`review-handoff.md` reserves for Walter.
+Ranked most severe first. "Walter's call" marks findings whose fix is a behaviour choice, which
+Walter makes.
 
 ### 1. High: the volume POST blocks on two serial Cast round-trips under a global lock
 
@@ -23,7 +28,7 @@ PyChromecast 14.0.10, each of these sends a message and then waits up to `REQUES
 s for the device's reply (`pychromecast/controllers/receiver.py:244-266`,
 `pychromecast/response_handler.py:50-57`, `pychromecast/const.py:13`). So one request costs two
 device round-trips, and up to 20 s if the Nest is slow. Shairport does not wait for the hook:
-`wait_for_completion` defaults to no (`common.c:1375`, `shairport.c:1262-1268`), so each slider
+`wait_for_completion` defaults to no (`common.c:1375`, `shairport.c:1269-1273`), so each slider
 tick forks its own curl at once and they all queue on the lock.
 
 Failure scenario, reproduced locally with a fake device answering in 300 ms per call. Eight
@@ -111,26 +116,33 @@ rebuffering, and a dropped session is never recovered (finding 3).
 The 0.5 s before idle starts also emits nothing, which leaves a 0.5 s hole in the MP3 stream
 every time AirPlay input stops.
 
-### 7. Medium (upstream, receiver): `msg_write_response` copies the body before checking its size
+### 7. Resolved upstream (receiver): `msg_write_response` copied the body before checking its size
 
-`rtsp.c:795-872`
+`rtsp.c:816-837`, `rtsp.c:839-969`; fixed by `013bd91c` (#2313, merged as `9ac7a068`)
 
-`pkt` is a 4096-byte stack buffer. Headers are bounds-checked as they are written, but the body
-is `memcpy`'d at `rtsp.c:863` and only checked afterwards, at `rtsp.c:869`.
+In 5.6, `pkt` was a 4096-byte stack buffer with a 1024-byte margin. Headers were bounds-checked
+as they were written, but the body was `memcpy`'d first and checked afterwards (5.6
+`rtsp.c:863-872`). Any response over about 3 KB was dropped with "Attempted to write overlong
+RTSP packet 3", and a body larger than the space left overflowed the stack.
 
-Failure scenarios:
+On the new base, headers go into a 16 KB buffer through `response_header_append`, which checks
+each field's length before advancing (`rtsp.c:816-837`). The body is checked against a 1 MB
+limit before anything is allocated or copied (`rtsp.c:919-924`), and the packet is then
+allocated at its exact size (`rtsp.c:925-934`). Neither failure scenario applies to a response
+under 1 MB.
 
-- Any response over about 3 KB is silently dropped, with "Attempted to write overlong RTSP
-  packet 3" and `return -3`.
-- A body larger than the space left overflows the stack.
+The upstream commit also names the response that overflowed: the PTP SETUP reply lists every
+non-loopback interface address (`rtsp.c:2594-2618`; the same loop is in 5.6). The receiver runs
+with `network_mode: host` (`cast-bridge/compose.yaml:5`) on a NAS that hosts Docker networks, so
+that reply is the likely cause of Hermes's reconnect failure. It stays a lead until the
+receiver's logs or the NAS's interface list confirm it.
 
-This is the mechanism behind Hermes's reconnect failure. Which response was too large (probably
-`GET /info` or a SETUP reply) can't be determined without live logs. A minimal receiver patch on
-`bridge` is possible, and so is reporting it upstream. Walter's call.
+The live stack still runs the 5.6 image (`cast-bridge/compose.yaml:3`), so the bug is live until
+a receiver built from `bridge` is deployed. When to deploy is Walter's call.
 
 ### 8. Low-Medium: the first session after a receiver restart sets the Nest to 20%
 
-`player.c:3748-3750`, `player.c:3350-3356`, `shairport.c:569`, `shairport.c:2057`
+`player.c:3826-3828`, `player.c:3398-3404`, `shairport.c:569`, `shairport.c:2062`
 
 Every player start calls `player_volume(suggested_volume(conn))`, which fires the hook. The
 argument is the connection's own volume if the sender has already sent one. Otherwise it is
@@ -167,7 +179,7 @@ makes the contract explicit.
 ### 11. Low: the tool docs contradict `CLAUDE.md`
 
 - `cast-bridge/tools/rtsp_volume_test.py:1` says it "MAY CHANGE VOLUME", but `CLAUDE.md` says
-  every tool except `hook_volume_test.py` is read-only. Per `rtsp.c:3154` it changes nothing
+  every tool except `hook_volume_test.py` is read-only. Per `rtsp.c:3231` it changes nothing
   unless it lands on the principal connection, but a misread could still move the volume. This
   review treats it as volume-changing and did not run it.
 - `cast-bridge/tools/hook_volume_test.py:6` refers to `compose.live.yaml`, which doesn't exist.
@@ -194,8 +206,8 @@ rather than claims, such as "buffer partial reads correctly", are left out.
 | F3 | An HTTP stream feeds the Nest via PyChromecast | confirmed (code) / untestable (device identity) | `bridge.py:212`; the UUID→"Bedroom Display" mapping needs the LAN |
 | F4 | No synchronised mixed AirPlay/Cast playback | confirmed | no clock or timestamp handling anywhere in `bridge.py` |
 | F5 | End-to-end latency is about 7 s, user-observed | untestable here | needs live playback |
-| F6 | Shairport appends the AirPlay value to the curl command | confirmed | `common.c:1350` `"%s %f"`, `poptParseArgvString` then `execv` (`common.c:1355-1368`) |
-| F7 | `ignore_volume_control = "yes"` disables Shairport gain | confirmed | `player.c:5233-5234` leaves attenuation at `max_db`; `player.c:5193-5195` skips mute |
+| F6 | Shairport appends the AirPlay value to the curl command | confirmed | `common.c:1353` `"%s %f"`, `poptParseArgvString` then `execv` (`common.c:1358-1370`) |
+| F7 | `ignore_volume_control = "yes"` disables Shairport gain | confirmed | `player.c:5315-5316` leaves attenuation at `max_db`; `player.c:5275-5277` skips mute |
 | F8 | -30..0 maps via `(v+30)/30`; -144 mutes; 0 mutes; invalid input rejected | confirmed | `bridge.py:25-33`; `tests/mapping_unit_test.py` passes |
 | F9 | The cap clamps rather than rescales; the device never goes above 50% | confirmed | `bridge.py:33`; `compose.yaml:51` |
 | F10 | Source-IP allowlisting is not authentication | confirmed | `bridge.py:139`; see finding 9 |
@@ -209,11 +221,11 @@ rather than claims, such as "buffer partial reads correctly", are left out.
 | F18 | After a 500 ms input stop, silence keeps Cast connected | confirmed, with a caveat | `bridge.py:101-110`; it runs at 0.988× real time (finding 6) |
 | F19 | The fragmented-write test preserved 92,160 bytes exactly | confirmed | ran `tests/fragmented_pcm_test.py`: PASS, 92160 |
 | F20 | Live samples after the fix showed zero inserted silence, and the sound was steady | untestable here | live |
-| F21 | After receiver recreation, iPhone attempts failed with "overlong RTSP packet 3" | message confirmed / occurrence untestable | the message is `rtsp.c:870`; mechanism in finding 7 |
+| F21 | After receiver recreation, iPhone attempts failed with "overlong RTSP packet 3" | message confirmed in 5.6 / occurrence untestable | the message was 5.6 `rtsp.c:870`; mechanism in finding 7. On the new base it appears only above the 16 KB header or 1 MB packet limit (`rtsp.c:830`, `rtsp.c:920`) |
 | F22 | A receiver-only restart let the control connection through | untestable here | live |
 | F23 | `GET /info` returning 200 does not validate the full handshake | confirmed | `tools/rtsp_info_check.py` sends unauthenticated OPTIONS and GET only |
-| F24 | The silent session had a SETUP without streams but no audio-stream SETUP, and so no principal connection | mechanism confirmed / observation untestable | in AirPlay 2 the principal is taken only on the SETUP with streams (`rtsp.c:2613-2628`) |
-| F25 | In that state, volume requests returned 200, logged "Principal conn is NULL", and did not run the hook | confirmed | `rtsp.c:3154-3165` (hook only for the principal), `rtsp.c:3342` (always 200) |
+| F24 | The silent session had a SETUP without streams but no audio-stream SETUP, and so no principal connection | mechanism confirmed / observation untestable | in AirPlay 2 the principal is taken only on the SETUP with streams (`rtsp.c:2690-2705`, via `get_play_lock` at `rtsp.c:383-392`) |
+| F25 | In that state, volume requests returned 200, logged "Principal conn is NULL", and did not run the hook | confirmed | `rtsp.c:3231-3242` (hook only for the principal), `rtsp.c:3419` (always 200). The message is now `debug(2)`, not `debug(1)` (`35f847d1`); the receiver's `-vvv` still logs it |
 | F26 | PCM counters stayed static while keepalive silence advanced | untestable here | consistent with `bridge.py:101-110` |
 | F27 | Pause/resume didn't help; routing back to the iPhone and re-selecting the bridge did | untestable here | live |
 | F28 | curl 2 s timeouts and `BrokenPipeError` occurred during slider activity | confirmed (reproduced) | local burst experiment, finding 1 |
@@ -228,14 +240,14 @@ rather than claims, such as "buffer partial reads correctly", are left out.
 
 | # | Claim | Verdict | Settled by |
 |---|---|---|---|
-| W1 | Upstream has no canonical AirPlay 2 → Cast recipe | confirmed | no "chromecast" or "google cast" anywhere in the tree outside `cast-bridge/` and `CLAUDE.md` |
+| W1 | Upstream has no canonical AirPlay 2 → Cast recipe | confirmed | no "chromecast" or "google cast" anywhere in `upstream/development`; in this checkout only in `cast-bridge/` and `CLAUDE.md` |
 | W2 | The pipe and stdout backends are documented extension points | confirmed | `audio_pipe.c`, `audio_stdout.c`; `scripts/shairport-sync.conf` pipe stanza |
 | W3 | The sample config documents the appended argument, the -30..0 range and the -144 mute | confirmed | `scripts/shairport-sync.conf:86-88` |
-| W4 | `ignore_volume_control = "yes"` avoids software attenuation | confirmed | `player.c:5233-5234` |
-| W5 | `volume_control_profile` only affects Shairport's own mixer mapping | confirmed | `player.c:5234-5243` uses it only when `ignore_volume_control == 0` |
-| W6 | Volume events need no receiver fork or core patch | confirmed | `shairport.c:1021` reads `general.run_this_when_volume_is_set`; finding 7 is a separate reason to patch |
-| W7 | Standalone RTSP volume commands are ignored unless sent on the principal connection | confirmed | `rtsp.c:3154-3165` |
-| W8 | `command_set_volume` appends the value, parses argv and execs directly, not via a shell | confirmed | `common.c:1341-1368` |
-| W9 | `player.c` runs the volume callback before attenuation handling | confirmed | `player.c:5344-5345` |
-| W10 | `rtsp.c` checks the principal connection before SET_PARAMETER volume | confirmed | `rtsp.c:3152-3154` |
-| W11 | The running image reports `5.6-dirty-AirPlay2-smi11` | untestable here | needs the NAS. "dirty" means it was built from a modified tree, so the digest in `compose.yaml:3` isn't proven to equal tag 5.6; "SMI 11" matches commit `4ff74895` |
+| W4 | `ignore_volume_control = "yes"` avoids software attenuation | confirmed | `player.c:5315-5316` |
+| W5 | `volume_control_profile` only affects Shairport's own mixer mapping | confirmed | `player.c:5316-5325` uses it only when `ignore_volume_control == 0` |
+| W6 | Volume events need no receiver fork or core patch | confirmed | `shairport.c:1021` reads `general.run_this_when_volume_is_set`; finding 7 was a separate reason to patch, and upstream has fixed it |
+| W7 | Standalone RTSP volume commands are ignored unless sent on the principal connection | confirmed | `rtsp.c:3231-3242` |
+| W8 | `command_set_volume` appends the value, parses argv and execs directly, not via a shell | confirmed | `common.c:1341-1370` |
+| W9 | `player.c` runs the volume callback before attenuation handling | confirmed | `player.c:5426-5427` |
+| W10 | `rtsp.c` checks the principal connection before SET_PARAMETER volume | confirmed | `rtsp.c:3229-3231` |
+| W11 | The running image reports `5.6-dirty-AirPlay2-smi11` | untestable here | needs the NAS. "dirty" means it was built from a modified tree, so the digest in `compose.yaml:3` isn't proven to equal tag 5.6; "SMI 11" matches commit `4ff74895`, which is in 5.6. A receiver built from `bridge` would report a 5.7-dev version instead |
