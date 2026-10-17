@@ -63,3 +63,19 @@ time.sleep(bridge.VOLUME_RETRY_DELAY*bridge.VOLUME_ATTEMPTS+.3)
 assert bridge.stats['volume_error']['attempt']==bridge.VOLUME_ATTEMPTS,bridge.stats['volume_error']
 assert bridge.stats['volume_applied']['airplay_db']==-15
 print('PASS failed volume applies are retried, reported, then given up')
+# A Hub that is mid-reconnect longer than VOLUME_ATTEMPTS retries must not lose the command.
+cast.socket_client=types.SimpleNamespace(is_connected=False)
+def refused(level):
+    if cast.socket_client.is_connected: return FakeCast.set_volume(cast,level)
+    raise RuntimeError('NotConnected')
+cast.set_volume=refused;cast.status.volume_level=.2;cast.calls.clear()
+post(-21)
+time.sleep(bridge.VOLUME_RETRY_DELAY*(bridge.VOLUME_ATTEMPTS+2))
+assert 'volume_applied' in bridge.stats and bridge.stats['volume_applied']['airplay_db']==-15
+cast.socket_client.is_connected=True
+deadline=time.monotonic()+3
+while bridge.stats['volume_applied']['airplay_db']!=-21:
+    assert time.monotonic()<deadline,bridge.stats.get('volume_error')
+    time.sleep(.05)
+assert abs(cast.status.volume_level-.3)<.001
+print('PASS a volume change waits out a reconnect longer than the retry count')
