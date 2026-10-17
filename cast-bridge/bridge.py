@@ -27,22 +27,21 @@ def map_airplay_volume(value, cap):
     if not math.isfinite(value) or not 0 <= cap <= 1:
         raise ValueError('Invalid volume')
     if value == -144.0:
-        return 0.0, True
+        return 0.0, True, 0.0
     if not -30.0 <= value <= 0.0:
         raise ValueError('AirPlay volume outside -30..0 or mute -144')
     requested = (value + 30.0) / 30.0
-    return min(requested, cap), requested <= 0
+    return min(requested, cap), requested <= 0, requested
 
 
 def request_airplay_volume(value):
     """Queue a volume change and return at once; volume_worker applies it."""
     global volume_pending
     cap = float(os.environ.get('CAST_VOLUME_CAP', '0.5'))
-    level, muted = map_airplay_volume(value, cap)
+    level, muted, requested = map_airplay_volume(value, cap)
     if cast_target is None:
         raise RuntimeError('Cast target not ready')
-    command = {'airplay_db': value, 'requested_fraction':
-        0.0 if value == -144 else (value + 30) / 30,
+    command = {'airplay_db': value, 'requested_fraction': requested,
         'target_fraction': level, 'muted': muted, 'cap': cap,
         'received_at': time.time()}
     with volume_cond:
