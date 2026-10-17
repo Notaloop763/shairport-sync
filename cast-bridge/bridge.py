@@ -18,7 +18,8 @@ BLOCK = RATE * FRAME_BYTES // 50
 stats = {'pcm_bytes': 0, 'nonzero_blocks': 0, 'mp3_bytes': 0, 'clients': 0, 'cast': None}
 subscribers = set()
 lock = threading.Lock()
-volume_lock = threading.Lock()
+volume_cond = threading.Condition()
+volume_pending = None  # newest volume command not yet applied
 cast_target = None
 
 
@@ -33,20 +34,49 @@ def map_airplay_volume(value, cap):
     return min(requested, cap), requested <= 0
 
 
-def apply_airplay_volume(value):
+def request_airplay_volume(value):
+    """Queue a volume change and return at once; volume_worker applies it."""
+    global volume_pending
     cap = float(os.environ.get('CAST_VOLUME_CAP', '0.5'))
     level, muted = map_airplay_volume(value, cap)
-    with volume_lock:
-        if cast_target is None:
-            raise RuntimeError('Cast target not ready')
+    if cast_target is None:
+        raise RuntimeError('Cast target not ready')
+    command = {'airplay_db': value, 'requested_fraction':
+        0.0 if value == -144 else (value + 30) / 30,
+        'target_fraction': level, 'muted': muted, 'cap': cap,
+        'received_at': time.time()}
+    with volume_cond:
+        # Shairport forks a hook per slider tick without waiting, so only the
+        # newest value matters; older ones still pending are dropped.
+        volume_pending = command
+        stats['volume_command'] = command
+        volume_cond.notify()
+    print('VOLUME_COMMAND', json.dumps(command), flush=True)
+    return command
+
+
+def apply_volume(level, muted):
+    # Skip calls the device already matches; each costs a Cast round-trip.
+    status = cast_target.status
+    if status is None or abs(status.volume_level - level) > 0.001:
         cast_target.set_volume(level)
+    if status is None or status.volume_muted != muted:
         cast_target.set_volume_muted(muted)
-        stats['volume_command'] = {'airplay_db': value, 'requested_fraction':
-            0.0 if value == -144 else (value + 30) / 30,
-            'target_fraction': level, 'muted': muted, 'cap': cap,
-            'received_at': time.time()}
-        print('VOLUME_COMMAND', json.dumps(stats['volume_command']), flush=True)
-    return stats['volume_command']
+
+
+def volume_worker():
+    global volume_pending
+    while True:
+        with volume_cond:
+            while volume_pending is None:
+                volume_cond.wait()
+            command, volume_pending = volume_pending, None
+        try:
+            apply_volume(command['target_fraction'], command['muted'])
+        except Exception as exc:
+            print('VOLUME_FAILURE', repr(exc), flush=True)
+            continue
+        stats['volume_applied'] = dict(command, applied_at=time.time())
 
 
 def discover():
@@ -144,7 +174,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length <= 64:
                 raise ValueError('Invalid body size')
             value = float(self.rfile.read(length).decode('ascii').strip())
-            result = apply_airplay_volume(value)
+            result = request_airplay_volume(value)
         except ValueError as exc:
             self.send_error(400, str(exc))
             return
@@ -152,7 +182,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(503, str(exc))
             return
         data = json.dumps(result).encode()
-        self.send_response(200)
+        self.send_response(202)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
@@ -247,6 +277,7 @@ def main():
             os._exit(1)
     threading.Thread(target=guarded_feed, daemon=True).start()
     threading.Thread(target=broadcast, args=(proc,), daemon=True).start()
+    threading.Thread(target=volume_worker, daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     time.sleep(2)
