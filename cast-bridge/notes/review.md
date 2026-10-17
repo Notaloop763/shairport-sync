@@ -182,6 +182,8 @@ makes the contract explicit.
 
 ### 11. Low: the tool docs contradict `CLAUDE.md`
 
+**Fixed:** `rtsp_volume_test.py` removed in `6208e758`; the `compose.live.yaml` reference fixed in `a93f98de`.
+
 - `cast-bridge/tools/rtsp_volume_test.py:1` says it "MAY CHANGE VOLUME", but `CLAUDE.md` says
   every tool except `hook_volume_test.py` is read-only. Per `rtsp.c:3231` it changes nothing
   unless it lands on the principal connection, but a misread could still move the volume. This
