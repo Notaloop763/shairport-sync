@@ -37,3 +37,29 @@ assert abs(cast.status.volume_level-.425)<.001 and not cast.status.volume_muted
 assert len(cast.calls)<len(values) and all(k=='level' for k,_ in cast.calls),cast.calls
 print('PASS volume POST answers at once and applies the newest value',
       f'(max {max(latencies)*1000:.0f} ms, {len(cast.calls)} Cast calls for {len(values)} ticks)')
+# Unmute from -144 to -15 where the mute call fails twice: the level lands, mute does not,
+# so the Nest sits muted at 50%. The worker reports it and retries until both match.
+bridge.VOLUME_RETRY_DELAY=.1
+failures=[RuntimeError('RequestTimeout'),RuntimeError('NotConnected')]
+real_muted=cast.set_volume_muted
+def flaky_muted(muted):
+    if failures: raise failures.pop(0)
+    real_muted(muted)
+cast.set_volume_muted=flaky_muted
+cast.status.volume_muted=True;cast.calls.clear()
+post(-15)
+deadline=time.monotonic()+3
+while bridge.stats.get('volume_applied',{}).get('airplay_db')!=-15:
+    assert time.monotonic()<deadline,(cast.calls,bridge.stats.get('volume_error'))
+    time.sleep(.05)
+assert cast.status.volume_level==.5 and not cast.status.volume_muted,cast.status
+assert cast.calls==[('level',.5),('muted',False)],cast.calls
+assert 'volume_error' not in bridge.stats
+# A device that keeps failing is given up on after VOLUME_ATTEMPTS, with the error kept for /status.
+def dead(level): raise RuntimeError('NotConnected')
+cast.set_volume=dead;cast.calls.clear()
+post(-20)
+time.sleep(bridge.VOLUME_RETRY_DELAY*bridge.VOLUME_ATTEMPTS+.3)
+assert bridge.stats['volume_error']['attempt']==bridge.VOLUME_ATTEMPTS,bridge.stats['volume_error']
+assert bridge.stats['volume_applied']['airplay_db']==-15
+print('PASS failed volume applies are retried, reported, then given up')

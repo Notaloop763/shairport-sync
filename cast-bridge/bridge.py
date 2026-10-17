@@ -64,19 +64,38 @@ def apply_volume(level, muted):
         cast_target.set_volume_muted(muted)
 
 
+VOLUME_ATTEMPTS = 3
+VOLUME_RETRY_DELAY = 1.0
+
+
 def volume_worker():
     global volume_pending
+    command, attempts = None, 0
     while True:
         with volume_cond:
-            while volume_pending is None:
-                volume_cond.wait()
-            command, volume_pending = volume_pending, None
+            if command is None:
+                while volume_pending is None:
+                    volume_cond.wait()
+            else:
+                # Retry the failed command unless a newer one arrives first.
+                volume_cond.wait_for(lambda: volume_pending is not None, VOLUME_RETRY_DELAY)
+            if volume_pending is not None:
+                command, volume_pending, attempts = volume_pending, None, 0
+        attempts += 1
         try:
             apply_volume(command['target_fraction'], command['muted'])
         except Exception as exc:
-            print('VOLUME_FAILURE', repr(exc), flush=True)
+            # A failure between the two calls leaves level and mute out of step;
+            # the retry compares against the device status and sends what is left.
+            stats['volume_error'] = {'error': repr(exc), 'airplay_db': command['airplay_db'],
+                                     'attempt': attempts, 'at': time.time()}
+            print('VOLUME_FAILURE', json.dumps(stats['volume_error']), flush=True)
+            if attempts >= VOLUME_ATTEMPTS:
+                command = None
             continue
         stats['volume_applied'] = dict(command, applied_at=time.time())
+        stats.pop('volume_error', None)
+        command = None
 
 
 def discover():
