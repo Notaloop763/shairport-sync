@@ -4,7 +4,7 @@ Scope: every file under `cast-bridge/`, read in full, checked against the PyChro
 wheel that the `Dockerfile` pins and against the shairport-sync source on `upstream/development`
 at `380e6b1b` (5.7-dev-23), which `bridge` is built on. Source citations without a directory are
 shairport-sync files at the repo root, at that commit. `pychromecast/…` paths are inside that
-wheel. The bridge code is byte-identical to `69c96d82`, so its citations are unchanged.
+wheel. Citations to `bridge.py` and `compose.yaml` are to `69c96d82`, the code as imported. `bridge.py` has changed since: findings 1 and 2 are fixed (below), so their line numbers no longer match.
 
 The review was first written against tag `5.6`, and the live stack still runs a receiver image
 built from 5.6 (`cast-bridge/compose.yaml:3`). Where receiver behaviour differs between 5.6 and
@@ -20,6 +20,8 @@ Ranked most severe first. "Walter's call" marks findings whose fix is a behaviou
 Walter makes.
 
 ### 1. High: the volume POST blocks on two serial Cast round-trips under a global lock
+
+**Fixed in `47a8aa1c`** (the POST now queues the newest value and a worker applies it).
 
 `cast-bridge/bridge.py:39-43`, `cast-bridge/compose.yaml:71`
 
@@ -45,6 +47,8 @@ already queued. `threading.Lock` does not grant waiters in FIFO order, so the va
 is not guaranteed to be the last one sent.
 
 ### 2. High: Cast errors escape the POST handler and can leave volume half-applied
+
+**Fixed in `5bdbf6b6`** (failed applies are retried and reported in `/status`).
 
 `cast-bridge/bridge.py:147-153`, `cast-bridge/bridge.py:42-43`
 
