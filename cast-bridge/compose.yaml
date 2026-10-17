@@ -1,0 +1,75 @@
+services:
+  shairport-sync:
+    image: mikebrady/shairport-sync@sha256:ff6235d83fa10c78600f4c7c803f33825bd050df3e7c3c60cc94b3572569d6d6
+    container_name: shairport-sync
+    network_mode: host
+    restart: unless-stopped
+    cap_add:
+      - SYS_NICE
+    environment:
+      ENABLE_AVAHI: "0"
+    depends_on:
+      cast-bridge:
+        condition: service_healthy
+    volumes:
+      - audio:/audio
+      - type: bind
+        source: /run/dbus
+        target: /var/run/dbus
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /run/avahi-daemon
+        target: /var/run/avahi-daemon
+        read_only: true
+        bind:
+          create_host_path: false
+    configs:
+      - source: shairport-config-v4
+        target: /etc/shairport-sync.conf
+    command: ["-a", "Nest AirPlay Bridge (Test)", "-p", "7000", "-o", "pipe", "-vvv", "--statistics", "--", "/audio/pcm"]
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '^/usr/local/bin/shairport-sync ' >/dev/null && pgrep -f '^/usr/local/bin/nqptp' >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+  cast-bridge:
+    image: shairport-cast-bridge:prototype-5
+    container_name: shairport-cast-bridge
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      BRIDGE_HOST: "192.168.77.89"
+      BRIDGE_PORT: "18765"
+      CAST_VOLUME_CAP: "0.5"
+      CAST_UUID: "1af73ec2-959b-183f-f950-ad6a08e20ccc"
+    volumes:
+      - audio:/audio
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://192.168.77.89:18765/health',timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+configs:
+  shairport-config-v4:
+    content: |
+      general = {
+        ignore_volume_control = "yes";
+        run_this_when_volume_is_set = "/usr/bin/curl --fail --silent --show-error --max-time 2 http://192.168.77.89:18765/airplay-volume --data ";
+      };
+      pipe = { name = "/audio/pcm"; };
+volumes:
+  audio:
