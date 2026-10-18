@@ -1476,6 +1476,15 @@ void handle_flushbuffered(rtsp_conn_info *conn, rtsp_message *req, rtsp_message 
 
     pthread_mutex_unlock(&conn->flush_mutex);
     plist_free(messagePlist);
+#ifdef CONFIG_METADATA
+    // as in player_flush, a flush before the first packet is bogus
+    if ((flushFromValid == 0) && (conn->first_packet_timestamp)) {
+      // as for a classic FLUSH: frames up to but not including this one are flushed
+      char numbuf[32];
+      snprintf(numbuf, sizeof(numbuf), "%u", (uint32_t)flushUntilTS);
+      send_ssnc_metadata('pfls', numbuf, strlen(numbuf), 1); // contains cancellation points
+    }
+#endif
   }
 
   resp->respcode = 200;

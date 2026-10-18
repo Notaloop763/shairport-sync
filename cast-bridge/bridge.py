@@ -18,6 +18,12 @@ BLOCK = RATE * FRAME_BYTES // 50
 stats = {'pcm_bytes': 0, 'nonzero_blocks': 0, 'mp3_bytes': 0, 'clients': 0, 'cast': None,
          'sent_bytes': {}}  # per open /live.mp3 connection, keyed 'ip:port'
 MP3_BYTES_PER_S = 24000  # libmp3lame CBR 192k at 48 kHz: 576-byte frames, no padding
+# No input probing: by default ffmpeg holds the first 5 s of PCM to analyse it, then sends it all
+# at once, and a Hub that connects meanwhile keeps that burst as extra playout delay.
+ENCODER = ['ffmpeg', '-hide_banner', '-loglevel', 'warning', '-probesize', '32', '-analyzeduration', '0',
+           '-f', 's32le', '-ar', str(RATE), '-ac', '2', '-i', 'pipe:0',
+           '-c:a', 'libmp3lame', '-b:a', '192k', '-write_xing', '0',
+           '-flush_packets', '1', '-f', 'mp3', 'pipe:1']
 subscribers = set()
 lock = threading.Lock()
 volume_cond = threading.Condition()
@@ -324,11 +330,7 @@ def main():
         return
     host = os.environ['BRIDGE_HOST']
     port = int(os.environ.get('BRIDGE_PORT', '18765'))
-    proc = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'warning',
-                             '-f', 's32le', '-ar', str(RATE), '-ac', '2', '-i', 'pipe:0',
-                             '-c:a', 'libmp3lame', '-b:a', '192k', '-write_xing', '0',
-                             '-flush_packets', '1', '-f', 'mp3', 'pipe:1'],
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    proc = subprocess.Popen(ENCODER, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     def guarded_feed():
         try:
             feed_pcm(proc, '/audio/pcm')
