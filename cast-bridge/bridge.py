@@ -65,6 +65,7 @@ def apply_volume(level, muted):
 
 VOLUME_ATTEMPTS = 3
 VOLUME_RETRY_DELAY = 1.0
+VOLUME_RECONNECT_WAIT = 60.0  # pychromecast took 1-155 s to reconnect in fake-Hub runs
 
 
 def volume_worker():
@@ -89,6 +90,9 @@ def volume_worker():
             stats['volume_error'] = {'error': repr(exc), 'airplay_db': command['airplay_db'],
                                      'attempt': attempts, 'at': time.time()}
             print('VOLUME_FAILURE', json.dumps(stats['volume_error']), flush=True)
+            reconnecting = not getattr(getattr(cast_target, 'socket_client', None), 'is_connected', True)
+            if reconnecting and time.time() - command['received_at'] < VOLUME_RECONNECT_WAIT:
+                attempts -= 1  # never reached the device; keep trying while pychromecast reconnects
             if attempts >= VOLUME_ATTEMPTS:
                 command = None
             continue
