@@ -1,7 +1,7 @@
 """Fake Google Cast receiver for reproducing Nest Hub failures; sits beneath pychromecast.
 
 Needs pychromecast (for its generated CastMessage proto) and zeroconf. Touches only localhost/LAN
-sockets of its own, never the real Hub.
+sockets of its own, never the real Hub. Advertised on a 127.x host, its mDNS stays on loopback.
 
 What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages that produces.
 "fake" says whether this module answers it.
@@ -73,7 +73,7 @@ import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pychromecast.generated.cast_channel_pb2 import CastMessage
-from zeroconf import ServiceInfo, Zeroconf
+from zeroconf import InterfaceChoice, ServiceInfo, Zeroconf
 
 NS_CONNECTION = 'urn:x-cast:com.google.cast.tp.connection'
 NS_HEARTBEAT = 'urn:x-cast:com.google.cast.tp.heartbeat'
@@ -126,7 +126,9 @@ class FakeCastDevice:
         # shortcut: capture grows ~24 kB/s at 192 kbit/s without bound; cap it if runs get long.
         self.capture, self.pull_stop = bytearray(), threading.Event()
         self.conns = {}  # socket -> send lock
-        self.zc, self.info, self.listener = Zeroconf(), None, None
+        # A loopback fake announces on loopback only, so its mDNS never reaches the LAN.
+        self.zc = Zeroconf(interfaces=['127.0.0.1'] if host.startswith('127.') else InterfaceChoice.All)
+        self.info, self.listener = None, None
         self.log = []
         for key, value in faults.items():
             if value is not None:
