@@ -15,7 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 RATE = 48000
 FRAME_BYTES = 8  # Shairport pipe defaults: stereo S32_LE / 48 kHz in AirPlay 2 builds
 BLOCK = RATE * FRAME_BYTES // 50
-stats = {'pcm_bytes': 0, 'nonzero_blocks': 0, 'mp3_bytes': 0, 'clients': 0, 'cast': None}
+stats = {'pcm_bytes': 0, 'nonzero_blocks': 0, 'mp3_bytes': 0, 'clients': 0, 'cast': None,
+         'sent_bytes': {}}  # per open /live.mp3 connection, keyed 'ip:port'
+MP3_BYTES_PER_S = 24000  # libmp3lame CBR 192k at 48 kHz: 576-byte frames, no padding
 subscribers = set()
 lock = threading.Lock()
 volume_cond = threading.Condition()
@@ -222,9 +224,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif self.path == '/live.mp3':
             q = queue.Queue(maxsize=128)
+            key = '%s:%d' % self.client_address[:2]
             with lock:
                 subscribers.add(q)
                 stats['clients'] = len(subscribers)
+                stats['sent_bytes'][key] = 0
             self.send_response(200)
             self.send_header('Content-Type', 'audio/mpeg')
             self.send_header('Cache-Control', 'no-store')
@@ -238,12 +242,14 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(data)
                     self.wfile.flush()
+                    stats['sent_bytes'][key] += len(data)
             except (OSError, queue.Empty):
                 pass
             finally:
                 with lock:
                     subscribers.discard(q)
                     stats['clients'] = len(subscribers)
+                    del stats['sent_bytes'][key]
                 self.close_connection = True
         else:
             self.send_error(404)
@@ -348,6 +354,12 @@ def main():
         status = target.media_controller.status if target else None
         if status and stats['cast']:
             stats['cast']['state'] = status.player_state
+            # Audio the Hub holds unplayed: seconds sent on its one connection minus its position.
+            with lock:
+                sent = [n for k, n in stats['sent_bytes'].items()
+                        if k.rpartition(':')[0] == stats['cast']['host']]
+            if len(sent) == 1 and status.adjusted_current_time is not None:
+                stats['cast']['lag_s'] = round(sent[0] / MP3_BYTES_PER_S - status.adjusted_current_time, 2)
         if status and status.player_state in ('PLAYING', 'BUFFERING') and status.content_id == stream:
             lost_since = wait_audio_since = None
             playing_since = playing_since or now
