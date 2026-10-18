@@ -33,7 +33,7 @@ repo at `upstream/development` 380e6b1b.
 |---|---|---|
 | Pause, rate 0 (`paus`, `rtsp.c:1577`) | Cast PAUSE immediately | step 1 |
 | Resume, rate 1 (`pres`, `rtsp.c:1562`) | PLAY; re-LOAD instead after a flush or a pause over 30 s | step 1 |
-| Flush-all (**no event**, see below) | Cast PAUSE; mark the next resume as needing a re-LOAD | step 1, needs the receiver patch |
+| Flush-all (`pfls`, receiver patch, see below) | Cast PAUSE; mark the next resume as needing a re-LOAD | step 1 |
 | Session begin/end (`pbeg`/`pend`, `player.c:5513`/`5558`) | LOAD / let the recovery loop own it | step 1 |
 | Volume (`pvol`, `player.c:5193`; today the curl hook) | SET_VOLUME through the existing worker, cap honoured | done (hook) |
 | Metadata block (`mdst`…`mden`, `rtsp.c:3367`; `PICT` artwork) | update Cast metadata without a re-LOAD | step 2 |
@@ -46,6 +46,22 @@ flush event, step 1 must either re-LOAD on every resume (costs startup lag each 
 on every resume (after a skip the Hub plays out the old track's buffered tail). Walter chose
 a receiver patch instead (2026-10-18): `receiver/ap2-flush-metadata` sends `pfls` from the
 AP2 flush-all path. Tracked in `tech-debt.md`.
+
+**What an iPhone actually sends** (patched receiver on the laptop, iPhone with Apple Music,
+2026-10-18):
+
+| iPhone action | Events on the pipe, in order |
+|---|---|
+| Start | `pbeg`, `pres`, `prsm`, `pffr` (no flush) |
+| Skip track | `pfls`, `pres`, `prsm` (no `paus`) |
+| Pause | `paus`, `pfls` |
+| Resume | `pres`, `prsm` |
+
+Two consequences for step 1. A skip is visible **only** through `pfls`; there is no pause
+event. And every pause is followed by a flush, so every resume re-LOADs: after the flush the
+iPhone resends audio from the pause point, which the Hub already holds, so PLAY would repeat
+up to `lag_s` of audio. The 30 s long-pause rule never decides anything for an iPhone. `prsm`
+still arrives despite being deprecated; key on `pres`.
 
 | Cast event (Hub touch, voice, Home app) | AirPlay command (MQTT `<topic>/remote`) | Status |
 |---|---|---|
