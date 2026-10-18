@@ -20,8 +20,14 @@ def until(cond,timeout):
     return False
 feed=bridge.feed_pcm
 bridge.feed_pcm=lambda proc,path:feed(proc,fifo)  # main() hard-codes /audio/pcm
+# Startup with the Hub not on the network: the first discovery fails after 20 s and main() retries
+# 5 s later instead of exiting.
+dev.configure({'withdraw':True})
 threading.Thread(target=bridge.main,daemon=True).start()
+time.sleep(25);assert bridge.stats['cast'] is None and bridge.cast_target is None,bridge.stats
+dev.configure({'advertise':{}});t=time.monotonic()
 assert until(lambda:bridge.stats['cast'],60),dev.log
+print(f'PASS startup with the Hub missing: no cast after 25 s, then cast {time.monotonic()-t:.0f}s after it advertised')
 state=json.load(urllib.request.urlopen('http://127.0.0.1:18110/state'))
 assert state['app_id']=='CC1AD845',state
 assert state['load']=={'contentId':'http://127.0.0.1:18865/live.mp3','contentType':'audio/mpeg','streamType':'LIVE'},state
@@ -100,11 +106,11 @@ def fresh(n,**faults):
                           'Google Nest Hub',18109+100*n,'127.0.0.1',18110+100*n,**faults))
     return fakes[-1]
 d=fresh(2,launch_delay=8);t=time.monotonic()
-cast,_=bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
+cast,_=bridge.connect(str(d.uuid));bridge.load_stream(cast,stream)
 launches=sum('LAUNCH' in l for l in d.log)
 # play_media() relaunches when the app is not up yet 2 s after launch(), so two LAUNCHes.
 assert launches==2 and d.state()['player_state']=='PLAYING' and d.capture,d.log
-say('launch_delay',f'cast_audio succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
+say('launch_delay',f'casting succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
 # Another sender takes the Hub, or its app quits: pychromecast drops our media status to UNKNOWN
 # (never IDLE). A person chose this, so the bridge stays put until AirPlay plays again.
 for fault,app in (('takeover','CC32E753'),('close_app',None)):
@@ -116,5 +122,10 @@ for fault,app in (('takeover','CC32E753'),('close_app',None)):
     t=time.monotonic();play(tone(1000,1))
     assert until(lambda:playing(n+1),30),(bridge.stats['cast'],dev.log[-6:])
     say(fault,f'new AirPlay audio: recast and playing {time.monotonic()-t:.0f}s after play')
+# The Hub reboots: the connection drops and it comes back with no app. Nobody chose that, so the
+# bridge recasts with no AirPlay audio, unlike close_app above.
+n=loads();dev.configure({'close_app':True,'drop':True});t=time.monotonic()
+assert until(lambda:playing(n+1),40),(bridge.stats['cast'],dev.log[-6:])
+say('reboot',f'connection dropped and no app: recast {time.monotonic()-t:.0f}s later with no AirPlay audio')
 for d in (dev,*fakes): d.check_cap()
 print('PASS no SET_VOLUME above 0.5 reached any fake')

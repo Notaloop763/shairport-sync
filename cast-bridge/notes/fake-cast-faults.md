@@ -33,15 +33,19 @@ policy: when the Hub drops our stream, recast at once; when a person chose somet
 (another app, no app, idleReason CANCELLED or INTERRUPTED, another LOAD), wait for new AirPlay
 audio (input resuming after a stall, with sound in it). Each loss gets 5 attempts, spaced 5, 10,
 20 and 40 s apart, then the bridge waits for new AirPlay audio. 60 s of steady play refills the
-budget. `main()` declares a loss after 10 s without PLAYING or BUFFERING of our stream.
+budget. `main()` declares a loss after 10 s without PLAYING or BUFFERING of our stream. A loss
+that follows a dropped Cast connection (a Hub reboot or Wi-Fi loss) counts as the Hub dropping
+us, whatever app it comes back with, and no attempts are made while pychromecast reconnects.
 
 | Fault | Before | After (`fork/bridge-recovery`) | Verdict |
 |-------|--------|--------------------------------|---------|
 | Stream stops mid-play (`stop_stream`) | `IDLE` within 2 s, no reload: silent until restart | Recast 14 s after the stop, no AirPlay audio needed | Recovers |
-| LOAD answered with LOAD_FAILED (`load_error`) | `cast_audio()` raised after 22 s and `main()` exited | Each failed recast is logged (`RECAST_FAILURE`) and retried; after the last, `RECAST_GAVE_UP` and no more LOADs. New AirPlay audio recast it 8 s after play. Tested with 2 attempts, not 5 | Recovers |
+| LOAD answered with LOAD_FAILED (`load_error`) | Casting raised after 22 s and `main()` exited | Each failed recast is logged (`RECAST_FAILURE`) and retried; after the last, `RECAST_GAVE_UP` and no more LOADs. New AirPlay audio recast it 8 s after play. Tested with 2 attempts, not 5 | Recovers |
 | LAUNCH 8 s late (`launch_delay`) | A second LAUNCH from `play_media()`; casting after 11 s | Unchanged | Handled |
 | Another sender takes the Hub (`takeover`) | `UNKNOWN`, no reload: silent until restart | `CAST_LOST ... waiting_for_audio: true`; leaves Spotify alone for 20 s, recasts 8 s after AirPlay plays | Stays put, then recovers on AirPlay |
 | The app quits (`close_app`) | Same as takeover | Same as takeover, with no app | Stays put, then recovers on AirPlay |
+| The Hub reboots (`drop` + `close_app`) | Same as close_app | `CAST_LOST ... dropped: true`; recast 17-18 s later, no AirPlay audio needed | Recovers |
+| Hub missing at startup (`withdraw`, then `advertise`) | Discovery failed and `main()` exited | `RECAST_FAILURE` "not discovered"; cast 3 s after the Hub advertised | Recovers |
 
 pychromecast reports `UNKNOWN`, not `IDLE`, for takeover and close_app, so `main()` watches for
 PLAYING going away. A recast that fails while AirPlay is already playing waits for the next

@@ -7,13 +7,13 @@ What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages tha
 "fake" says whether this module answers it.
 
   discover()      get_chromecasts(timeout=15), stop_discovery   mDNS browse only          fake: advertised
-  cast_audio()    Zeroconf(unicast=True)                        mDNS                       fake: advertised
+  connect()       Zeroconf(unicast=True)                        mDNS                       fake: advertised
                   get_listed_chromecasts(uuids=[..])            mDNS (TXT id/fn/md, SRV)   fake: advertised
                   cast.wait(timeout=20)                         TLS connect (CERT_NONE),
                                                                 tp.connection CONNECT,
                                                                 receiver GET_STATUS,
                                                                 heartbeat PING every 10 s  fake: answered
-                  media_controller.launch()                     receiver LAUNCH            fake: answered
+  load_stream()   media_controller.launch()                     receiver LAUNCH            fake: answered
                                                                 tp.connection CONNECT to
                                                                 the app's transportId      fake: no reply, as real
                   media_controller.play_media()                 media LOAD                 fake: answered

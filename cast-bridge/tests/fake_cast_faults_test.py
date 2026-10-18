@@ -12,7 +12,7 @@ import bridge,pychromecast,zeroconf
 from fake_cast_device import FakeCastDevice
 UUID=uuid.UUID('f4a1c0de-0000-4000-8000-00000000fa4e')
 dev=FakeCastDevice(UUID,'Fake Hub','Google Nest Hub',18009,'127.0.0.1',18010)
-zc=zeroconf.Zeroconf(unicast=True)  # as cast_audio() does
+zc=zeroconf.Zeroconf(unicast=True)  # as bridge.connect() does
 cs,browser=pychromecast.get_listed_chromecasts(uuids=[UUID],discovery_timeout=10,zeroconf_instance=zc)
 cast=cs[0];cast.wait(timeout=10);bridge.cast_target=cast
 threading.Thread(target=bridge.volume_worker,daemon=True).start()
