@@ -35,6 +35,10 @@ failures while the socket is not connected do not count as attempts for up to
 | Stream stops mid-play (`stop_stream`) | `/status` showed `IDLE` and 0 clients within 2 s. Nothing reloaded; 10 s later the Hub was still idle. | **Gap**: silent until bridge.py restarts |
 | LOAD answered with LOAD_FAILED (`load_error`) | `cast_audio()` raised after 22 s (its 20 s PLAYING poll). In `main()` that ends the process. | Fails loudly; recovery depends on the container restart policy |
 | LAUNCH 8 s late (`launch_delay`) | `play_media()` 2 s after `launch()` found no app and sent a second LAUNCH; LOAD followed it. Casting started after 11 s. | Handled |
+| Another sender takes the Hub (`takeover`) | pychromecast saw Spotify's app and reset our media status to `UNKNOWN`, not `IDLE`. No reload; 10 s later no bytes pulled. | **Gap**: silent until bridge.py restarts, and `/status` says `UNKNOWN` |
+| The app quits (`close_app`) | pychromecast saw no app and `UNKNOWN`. No reload; 10 s later no bytes pulled. | **Gap**: same as takeover |
+
+A check on `cast.state == 'PLAYING'` catches all three gaps; one on `IDLE` would miss the last two.
 
 ## Fidelity to the real Hub
 
@@ -43,6 +47,7 @@ The fake's RECEIVER_STATUS and mDNS TXT keys copy that: `controlType: master`,
 `stepInterval` 0.02, float32 levels, no `isActiveInput`/`isStandBy`, `version: 2`, `userEq`.
 
 Not checked: an idle Hub's `applications` list (the fake sends `[]`), the media message shapes
-(MEDIA_STATUS, the app entry, LOAD_FAILED; taken from Google's Cast docs), whether a real Hub keeps
+(MEDIA_STATUS, the app entry, LOAD_FAILED, the takeover and app-close sequences; taken from
+Google's Cast docs), whether a real Hub keeps
 the session when the running app is relaunched, `cd`/`rm`/`bs` TXT values (made up), and how a real Hub behaves under any of the
 seven faults. Real Hub volume rounding and caps are unknown.
