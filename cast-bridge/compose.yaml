@@ -26,7 +26,7 @@ services:
         bind:
           create_host_path: false
     configs:
-      - source: shairport-config-v4
+      - source: shairport-config-v5
         target: /etc/shairport-sync.conf
     command: ["-a", "Nest AirPlay Bridge (Test)", "-p", "7000", "-o", "pipe", "-vvv", "--statistics", "--", "/audio/pcm"]
     healthcheck:
@@ -64,7 +64,7 @@ services:
         max-size: "5m"
         max-file: "3"
 configs:
-  shairport-config-v4:
+  shairport-config-v5:
     content: |
       general = {
         ignore_volume_control = "yes";
