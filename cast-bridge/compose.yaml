@@ -1,6 +1,6 @@
 services:
   shairport-sync:
-    image: mikebrady/shairport-sync@sha256:ff6235d83fa10c78600f4c7c803f33825bd050df3e7c3c60cc94b3572569d6d6
+    image: shairport-cast-receiver:prototype-1
     container_name: shairport-sync
     network_mode: host
     restart: unless-stopped
@@ -41,7 +41,7 @@ services:
         max-size: "5m"
         max-file: "3"
   cast-bridge:
-    image: shairport-cast-bridge:prototype-6
+    image: shairport-cast-bridge:prototype-9
     container_name: shairport-cast-bridge
     network_mode: host
     restart: unless-stopped
