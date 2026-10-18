@@ -28,3 +28,29 @@ assert state['load']=={'contentId':'http://127.0.0.1:18865/live.mp3','contentTyp
 print('PASS the fake launched',state['app_id'],'and loaded',state['load'])
 assert until(lambda:len(dev.capture)>0,5) and bridge.stats['clients']==1
 print('PASS the fake pulls the bridge stream:',len(dev.capture),'bytes so far')
+
+import numpy as np
+from fake_cast_device import listen
+def play(pcm):
+    """Write S32_LE stereo 48 kHz into the FIFO in real time, as Shairport paces it; return the
+    capture slice once it has drained through ffmpeg and the stream."""
+    start=len(dev.capture);fd=os.open(fifo,os.O_WRONLY);step=bridge.BLOCK;t0=time.monotonic()
+    for i in range(0,len(pcm),step):
+        os.write(fd,pcm[i:i+step])
+        time.sleep(max(0,t0+(i+step)/(bridge.RATE*bridge.FRAME_BYTES)-time.monotonic()))
+    os.close(fd);time.sleep(1.5)
+    return dev.capture[start:]
+def tone(hz,seconds,amp=.5):
+    s=(amp*2**31*np.sin(2*np.pi*hz*np.arange(int(bridge.RATE*seconds))/bridge.RATE)).astype('<i4')
+    return np.repeat(s,2).tobytes()
+def assert_tone(heard,hz,seconds):
+    assert heard['max_dbfs']>-40,f'silent: {heard}'
+    assert heard['rate']==bridge.RATE,f'sample rate: {heard}'
+    assert abs(heard['peak_hz']-hz)<=5,f'frequency: {heard}'
+    assert abs(heard['seconds']-seconds)<=.1,f'duration: {heard}'
+heard=listen(play(tone(1000,3)));assert_tone(heard,1000,3)
+print('PASS 3 s of 1 kHz reached the fake intact:',heard)
+heard=listen(play(bytes(bridge.RATE*bridge.FRAME_BYTES*2)))
+try: assert_tone(heard,1000,2)
+except AssertionError as exc: print('PASS silent input fails the tone check as intended: AssertionError',exc)
+else: raise AssertionError(f'silent input passed the tone check: {heard}')

@@ -46,13 +46,15 @@ and the LOAD's URL and content type.
 
 On LOAD the fake GETs the URL and keeps every byte in `capture`; playerState goes BUFFERING, then
 PLAYING on the first bytes, then IDLE (idleReason ERROR) if the stream ends. It refuses to fetch
-anything but loopback, so its runs stay off the LAN.
+anything but loopback, so its runs stay off the LAN. listen(capture) decodes and measures it (needs
+ffmpeg and numpy), so a test can tell whether the right audio arrived.
 
 MEDIA_STATUS and the app entry in RECEIVER_STATUS follow Google's Cast message docs; they are not
 yet read back from the real Hub.
 """
 import argparse
 import json
+import re
 import socket
 import ssl
 import struct
@@ -82,6 +84,26 @@ def f32(x):
 USER_EQ = {'high_shelf': {'frequency': 4500, 'gain_db': 6.0, 'quality': 0.707},
            'low_shelf': {'frequency': 150, 'gain_db': f32(-2.16), 'quality': 0.707},
            'max_peaking_eqs': 0, 'peaking_eqs': []}
+
+
+def listen(mp3):
+    """Decode MP3 bytes; return sample rate, seconds louder than -40 dBFS, loudest 20 ms window's
+    level, and the FFT peak of the loud stretch."""
+    import numpy as np
+    out = subprocess.run(['ffmpeg', '-hide_banner', '-f', 'mp3', '-i', 'pipe:0', '-ac', '1',
+                          '-f', 's16le', 'pipe:1'], input=bytes(mp3), capture_output=True, check=True)
+    rate = int(re.search(rb'Audio: mp3.*?, (\d+) Hz', out.stderr).group(1))
+    x = np.frombuffer(out.stdout, '<i2') / 32768
+    win = rate // 50
+    n = len(x) // win
+    rms = np.sqrt((x[:n * win].reshape(n, win) ** 2).mean(1)) if n else np.zeros(1)
+    loud = np.flatnonzero(rms > 10 ** (-40 / 20))
+    peak = None
+    if len(loud):
+        seg = x[loud[0] * win:(loud[-1] + 1) * win]
+        peak = float(np.abs(np.fft.rfft(seg * np.hanning(len(seg)))).argmax() * rate / len(seg))
+    return {'rate': rate, 'seconds': len(loud) / 50, 'peak_hz': peak,
+            'max_dbfs': float(20 * np.log10(max(rms.max(), 1e-10)))}
 
 
 class FakeCastDevice:
