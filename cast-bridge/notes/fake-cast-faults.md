@@ -25,12 +25,24 @@ about 2 s loses the command and nothing re-applies it. Fix is on `fork/volume-re
 failures while the socket is not connected do not count as attempts for up to
 `VOLUME_RECONNECT_WAIT` (60 s). That covers 7b but not 7c (155 s).
 
+## Media faults
+
+`tests/fake_cast_media_test.py` runs `bridge.main()` against the fake, 2026-10-18, on
+`fork/fake-cast-media`.
+
+| Fault | What the bridge did | Verdict |
+|-------|---------------------|---------|
+| Stream stops mid-play (`stop_stream`) | `/status` showed `IDLE` and 0 clients within 2 s. Nothing reloaded; 10 s later the Hub was still idle. | **Gap**: silent until bridge.py restarts |
+| LOAD answered with LOAD_FAILED (`load_error`) | `cast_audio()` raised after 22 s (its 20 s PLAYING poll). In `main()` that ends the process. | Fails loudly; recovery depends on the container restart policy |
+| LAUNCH 8 s late (`launch_delay`) | `play_media()` 2 s after `launch()` found no app and sent a second LAUNCH; LOAD followed it. Casting started after 11 s. | Handled |
+
 ## Fidelity to the real Hub
 
 Read from the Bedroom Display (192.168.77.86) with `cast_readback.py` once, while it was casting.
 The fake's RECEIVER_STATUS and mDNS TXT keys copy that: `controlType: master`,
 `stepInterval` 0.02, float32 levels, no `isActiveInput`/`isStandBy`, `version: 2`, `userEq`.
 
-Not checked: an idle Hub's `applications` list (the fake sends `[]`), the media path
-(LAUNCH, LOAD), `cd`/`rm`/`bs` TXT values (made up), and how a real Hub behaves under any of the
+Not checked: an idle Hub's `applications` list (the fake sends `[]`), the media message shapes
+(MEDIA_STATUS, the app entry, LOAD_FAILED; taken from Google's Cast docs), whether a real Hub keeps
+the session when the running app is relaunched, `cd`/`rm`/`bs` TXT values (made up), and how a real Hub behaves under any of the
 seven faults. Real Hub volume rounding and caps are unknown.

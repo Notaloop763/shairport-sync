@@ -38,6 +38,9 @@ Faults, settable at startup (flags) or at runtime: POST JSON to http://127.0.0.1
   {"ignore_set_volume": true}    accept SET_VOLUME, change nothing, send no reply
   {"clamp_max": 0.4, "round_step": 0.05}   the device's own cap / quantisation of SET_VOLUME levels
   {"set_level": 0.7, "set_muted": true}    a physical button: change state, push status to senders
+  {"load_error": true}           answer every LOAD with LOAD_FAILED
+  {"stop_stream": true}          stop pulling the stream now and report IDLE (idleReason ERROR)
+  {"launch_delay": 8.0}          start the app, and answer LAUNCH, N seconds late
   {"withdraw": true}             drop the mDNS advertisement
   {"advertise": {"host": "127.0.0.2", "port": 8019}}   (re-)advertise, optionally elsewhere; the
                                  old listener closes and a new one opens on the new port
@@ -114,6 +117,7 @@ class FakeCastDevice:
         self.level, self.muted = 1.0, False
         self.no_pong, self.delay, self.ignore_set_volume = False, 0.0, False
         self.clamp_max, self.round_step = None, None
+        self.load_error, self.launch_delay = False, 0.0
         self.app_id, self.session_id = None, None
         self.load, self.player_state, self.idle_reason = None, None, None  # load: the LOAD's media
         # shortcut: capture grows ~24 kB/s at 192 kbit/s without bound; cap it if runs get long.
@@ -155,6 +159,7 @@ class FakeCastDevice:
             return {'level': self.level, 'muted': self.muted, 'no_pong': self.no_pong,
                     'delay': self.delay, 'ignore_set_volume': self.ignore_set_volume,
                     'clamp_max': self.clamp_max, 'round_step': self.round_step,
+                    'load_error': self.load_error, 'launch_delay': self.launch_delay,
                     'app_id': self.app_id, 'player_state': self.player_state,
                     'load': self.load and {k: self.load.get(k) for k in
                                            ('contentId', 'contentType', 'streamType')},
@@ -162,7 +167,8 @@ class FakeCastDevice:
                     'connections': len(self.conns), 'log': self.log[-20:]}
 
     def configure(self, cmd):
-        for key in ('no_pong', 'delay', 'ignore_set_volume', 'clamp_max', 'round_step'):
+        for key in ('no_pong', 'delay', 'ignore_set_volume', 'clamp_max', 'round_step',
+                    'load_error', 'launch_delay'):
             if key in cmd:
                 setattr(self, key, cmd[key])
         if 'set_level' in cmd or 'set_muted' in cmd:
@@ -170,6 +176,9 @@ class FakeCastDevice:
                 self.level = float(cmd.get('set_level', self.level))
                 self.muted = bool(cmd.get('set_muted', self.muted))
             self.broadcast()
+        if cmd.get('stop_stream'):
+            self.pull_stop.set()
+            self.stream_ended('stream stopped by control')
         if cmd.get('withdraw'):
             self.withdraw()
         if 'advertise' in cmd:
@@ -319,6 +328,8 @@ class FakeCastDevice:
                     if not chunk:
                         break
                     with self.lock:
+                        if stop.is_set():
+                            break  # checked under the lock so a stop's IDLE is not overwritten
                         self.capture += chunk
                         first = self.player_state != 'PLAYING'
                         self.player_state = 'PLAYING'
@@ -327,12 +338,23 @@ class FakeCastDevice:
                         self.broadcast_media()
         except OSError as exc:
             self.note(f'stream error {exc!r}')
-        if stop.is_set():
-            return  # a newer LOAD or LAUNCH took over
+        if not stop.is_set():  # else a newer LOAD, LAUNCH or stop_stream took over
+            self.stream_ended('stream ended')
+
+    def stream_ended(self, why):
         with self.lock:
             self.player_state, self.idle_reason = 'IDLE', 'ERROR'
-        self.note('stream ended')
+        self.note(why)
         self.broadcast_media()
+
+    def launched(self, conn, msg, app_id, rid):
+        with self.lock:
+            # Relaunching the running app keeps its session (unverified on the real Hub).
+            if self.app_id != app_id:
+                self.app_id, self.session_id = app_id, str(uuidlib.uuid4())
+                self.load = self.player_state = self.idle_reason = None
+                self.pull_stop.set()
+        self.reply(conn, msg, NS_RECEIVER, self.status(rid))
 
     def handle(self, conn, msg):
         data = json.loads(msg.payload_utf8)
@@ -364,18 +386,16 @@ class FakeCastDevice:
                 self.reply(conn, msg, NS_RECEIVER, {'requestId': rid, 'type': 'LAUNCH_ERROR',
                                                     'reason': 'NOT_FOUND'})
                 return
-            with self.lock:
-                self.app_id, self.session_id = data['appId'], str(uuidlib.uuid4())
-                self.load = self.player_state = self.idle_reason = None
-                self.pull_stop.set()
-            self.reply(conn, msg, NS_RECEIVER, self.status(rid))
+            args = (conn, msg, data['appId'], rid)
+            threading.Timer(self.launch_delay, self.launched, args).start() \
+                if self.launch_delay else self.launched(*args)
         elif msg.namespace == NS_MEDIA and kind == 'GET_STATUS':
             self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
         elif msg.namespace == NS_MEDIA and kind == 'LOAD':
             media = data.get('media', {})
             url = media.get('contentId', '')
             self.note(f'LOAD {url} {media.get("contentType")}')
-            if not (urllib.parse.urlsplit(url).hostname or '').startswith('127.'):
+            if self.load_error or not (urllib.parse.urlsplit(url).hostname or '').startswith('127.'):
                 self.reply(conn, msg, NS_MEDIA, {'requestId': rid, 'type': 'LOAD_FAILED'},
                            self.session_id)
                 return
@@ -401,10 +421,13 @@ def main():
     p.add_argument('--ignore-set-volume', action='store_true', default=None)
     p.add_argument('--clamp-max', type=float)
     p.add_argument('--round-step', type=float)
+    p.add_argument('--load-error', action='store_true', default=None)
+    p.add_argument('--launch-delay', type=float)
     a = p.parse_args()
     dev = FakeCastDevice(uuidlib.UUID(a.uuid), a.name, a.model, a.port, a.host, a.control_port,
                          no_pong=a.no_pong, delay=a.delay, ignore_set_volume=a.ignore_set_volume,
-                         clamp_max=a.clamp_max, round_step=a.round_step)
+                         clamp_max=a.clamp_max, round_step=a.round_step,
+                         load_error=a.load_error, launch_delay=a.launch_delay)
     print(f'fake cast {a.uuid} "{a.name}" on {a.host}:{a.port}, control http://127.0.0.1:{a.control_port}/',
           flush=True)
     threading.Event().wait()

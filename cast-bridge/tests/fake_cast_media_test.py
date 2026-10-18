@@ -54,3 +54,28 @@ heard=listen(play(bytes(bridge.RATE*bridge.FRAME_BYTES*2)))
 try: assert_tone(heard,1000,2)
 except AssertionError as exc: print('PASS silent input fails the tone check as intended: AssertionError',exc)
 else: raise AssertionError(f'silent input passed the tone check: {heard}')
+
+# Media faults. stop_stream hits the bridge's own cast; the others need a fresh cast_audio().
+T0=time.monotonic()
+def say(fault,text): print(f'[{time.monotonic()-T0:5.1f}s] FAULT {fault}: {text}',flush=True)
+dev.configure({'stop_stream':True})
+assert until(lambda:bridge.stats['cast']['state']=='IDLE',10),(bridge.stats['cast'],dev.log[-5:])
+assert until(lambda:bridge.stats['clients']==0,20),bridge.stats
+say('stop_stream',f"bridge saw {bridge.stats['cast']['state']}, clients={bridge.stats['clients']}")
+time.sleep(10);assert dev.player_state=='IDLE' and sum('LOAD' in l for l in dev.log)==1,dev.log
+say('stop_stream','10 s later the bridge has not reloaded: the Hub stays silent until bridge.py restarts')
+stream='http://127.0.0.1:18865/live.mp3'
+def fresh(n,**faults):
+    return FakeCastDevice(uuid.UUID(f'f4a1c0de-0000-4000-8000-0000000000b{n}'),f'Fake Hub {n}',
+                          'Google Nest Hub',18109+100*n,'127.0.0.1',18110+100*n,**faults)
+d=fresh(1,load_error=True);t=time.monotonic()
+try: bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
+except RuntimeError as exc: say('load_error',f'cast_audio raised after {time.monotonic()-t:.0f}s: {exc!r:.80}')
+else: raise AssertionError(f'cast_audio succeeded although LOAD failed: {d.log}')
+assert sum('LOAD' in l for l in d.log)==1 and not d.capture,d.log
+d=fresh(2,launch_delay=8);t=time.monotonic()
+cast,_=bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
+launches=sum('LAUNCH' in l for l in d.log)
+# play_media() relaunches when the app is not up yet 2 s after launch(), so two LAUNCHes.
+assert launches==2 and d.state()['player_state']=='PLAYING' and d.capture,d.log
+say('launch_delay',f'cast_audio succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
