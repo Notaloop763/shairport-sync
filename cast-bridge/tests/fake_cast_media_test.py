@@ -93,5 +93,14 @@ launches=sum('LAUNCH' in l for l in d.log)
 # play_media() relaunches when the app is not up yet 2 s after launch(), so two LAUNCHes.
 assert launches==2 and d.state()['player_state']=='PLAYING' and d.capture,d.log
 say('launch_delay',f'cast_audio succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
+# Another sender takes the Hub, or its app quits: pychromecast drops our media status to UNKNOWN
+# (never IDLE), which is what bridge.main() copies into stats['cast']['state'].
+for n,fault,app in ((3,'takeover','CC32E753'),(4,'close_app',None)):
+    d=fresh(n);cast,_=bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
+    d.configure({fault:True});pulled=len(d.capture)
+    assert until(lambda:cast.status.app_id==app and cast.media_controller.status.player_state=='UNKNOWN',5),\
+        (cast.status,cast.media_controller.status,d.log[-4:])
+    time.sleep(10);assert len(d.capture)==pulled and sum('LOAD' in l for l in d.log)==1,d.log
+    say(fault,f'bridge saw app={app} state=UNKNOWN; 10 s later no reload and no bytes pulled: the Hub stays silent')
 for d in (dev,*fakes): d.check_cap()
 print('PASS no SET_VOLUME above 0.5 reached any fake')

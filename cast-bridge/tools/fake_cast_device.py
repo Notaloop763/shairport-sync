@@ -1,7 +1,7 @@
 """Fake Google Cast receiver for reproducing Nest Hub failures; sits beneath pychromecast.
 
 Needs pychromecast (for its generated CastMessage proto) and zeroconf. Touches only localhost/LAN
-sockets of its own, never the real Hub.
+sockets of its own, never the real Hub. Advertised on a 127.x host, its mDNS stays on loopback.
 
 What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages that produces.
 "fake" says whether this module answers it.
@@ -43,6 +43,11 @@ Faults, settable at startup (flags) or at runtime: POST JSON to http://127.0.0.1
   {"load_error": true}           answer every LOAD with LOAD_FAILED
   {"stop_stream": true}          stop pulling the stream now and report IDLE (idleReason ERROR)
   {"launch_delay": 8.0}          start the app, and answer LAUNCH, N seconds late
+  {"takeover": true}             another sender casts: media IDLE (INTERRUPTED), then Spotify's
+                                 app replaces ours in RECEIVER_STATUS
+  {"close_app": true}            the app quits: tp.connection CLOSE from its transportId, then a
+                                 RECEIVER_STATUS with no app
+                                 (both sequences follow the Cast docs, unverified on the real Hub)
   {"withdraw": true}             drop the mDNS advertisement
   {"advertise": {"host": "127.0.0.2", "port": 8019}}   (re-)advertise, optionally elsewhere; the
                                  old listener closes and a new one opens on the new port
@@ -73,13 +78,13 @@ import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pychromecast.generated.cast_channel_pb2 import CastMessage
-from zeroconf import ServiceInfo, Zeroconf
+from zeroconf import InterfaceChoice, ServiceInfo, Zeroconf
 
 NS_CONNECTION = 'urn:x-cast:com.google.cast.tp.connection'
 NS_HEARTBEAT = 'urn:x-cast:com.google.cast.tp.heartbeat'
 NS_RECEIVER = 'urn:x-cast:com.google.cast.receiver'
 NS_MEDIA = 'urn:x-cast:com.google.cast.media'
-APPS = {'CC1AD845': 'Default Media Receiver'}
+APPS = {'CC1AD845': 'Default Media Receiver', 'CC32E753': 'Spotify'}
 
 
 def f32(x):
@@ -126,7 +131,9 @@ class FakeCastDevice:
         # shortcut: capture grows ~24 kB/s at 192 kbit/s without bound; cap it if runs get long.
         self.capture, self.pull_stop = bytearray(), threading.Event()
         self.conns = {}  # socket -> send lock
-        self.zc, self.info, self.listener = Zeroconf(), None, None
+        # A loopback fake announces on loopback only, so its mDNS never reaches the LAN.
+        self.zc = Zeroconf(interfaces=['127.0.0.1'] if host.startswith('127.') else InterfaceChoice.All)
+        self.info, self.listener = None, None
         self.log = []
         for key, value in faults.items():
             if value is not None:
@@ -183,6 +190,10 @@ class FakeCastDevice:
         if cmd.get('stop_stream'):
             self.pull_stop.set()
             self.stream_ended('stream stopped by control')
+        if cmd.get('takeover'):
+            self.takeover()
+        if cmd.get('close_app'):
+            self.close_app()
         if cmd.get('withdraw'):
             self.withdraw()
         if 'advertise' in cmd:
@@ -354,6 +365,29 @@ class FakeCastDevice:
             self.player_state, self.idle_reason = 'IDLE', 'ERROR'
         self.note(why)
         self.broadcast_media()
+
+    def takeover(self):
+        """Another sender casts (Spotify): our media goes IDLE (INTERRUPTED), then its app replaces ours."""
+        self.pull_stop.set()
+        with self.lock:
+            self.player_state, self.idle_reason = 'IDLE', 'INTERRUPTED'
+        self.broadcast_media()
+        with self.lock:
+            self.app_id, self.session_id = 'CC32E753', str(uuidlib.uuid4())
+            self.load = self.player_state = self.idle_reason = None
+        self.note('taken over by CC32E753')
+        self.broadcast()
+
+    def close_app(self):
+        """The app quits ("Hey Google, stop"): it closes its virtual connection and leaves the receiver."""
+        self.pull_stop.set()
+        with self.lock:
+            session, self.app_id, self.session_id = self.session_id, None, None
+            self.load = self.player_state = self.idle_reason = None
+        for conn in list(self.conns):
+            self.reply(conn, CastMessage(source_id='sender-0'), NS_CONNECTION, {'type': 'CLOSE'}, session)
+        self.note(f'app closed session {session}')
+        self.broadcast()
 
     def launched(self, conn, msg, app_id, rid):
         with self.lock:
