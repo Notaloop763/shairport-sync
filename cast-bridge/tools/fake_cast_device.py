@@ -4,7 +4,7 @@ Needs pychromecast (for its generated CastMessage proto) and zeroconf. Touches o
 sockets of its own, never the real Hub.
 
 What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages that produces.
-"fake" says whether this module answers it; the rest is out of scope for the volume path.
+"fake" says whether this module answers it.
 
   discover()      get_chromecasts(timeout=15), stop_discovery   mDNS browse only          fake: advertised
   cast_audio()    Zeroconf(unicast=True)                        mDNS                       fake: advertised
@@ -13,8 +13,11 @@ What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages tha
                                                                 tp.connection CONNECT,
                                                                 receiver GET_STATUS,
                                                                 heartbeat PING every 10 s  fake: answered
-                  media_controller.launch() / play_media()      receiver LAUNCH, media LOAD fake: NOT answered
-                  media_controller.status                       media GET_STATUS           fake: NOT answered
+                  media_controller.launch()                     receiver LAUNCH            fake: answered
+                                                                tp.connection CONNECT to
+                                                                the app's transportId      fake: no reply, as real
+                  media_controller.play_media()                 media LOAD                 fake: answered
+                  media_controller.status                       media GET_STATUS           fake: answered
                   cast_info.friendly_name / host / model_name   mDNS TXT                   fake: advertised
   apply_volume()  cast.status.volume_level / volume_muted       cached RECEIVER_STATUS     fake: answered
                   cast.set_volume(level)                        receiver SET_VOLUME {volume:{level}}
@@ -36,7 +39,11 @@ Faults, settable at startup (flags) or at runtime: POST JSON to http://127.0.0.1
   {"withdraw": true}             drop the mDNS advertisement
   {"advertise": {"host": "127.0.0.2", "port": 8019}}   (re-)advertise, optionally elsewhere; the
                                  old listener closes and a new one opens on the new port
-GET / returns the current state as JSON.
+GET / (any path, e.g. /state) returns the current state as JSON, including the launched App ID
+and the LOAD's URL and content type.
+
+MEDIA_STATUS and the app entry in RECEIVER_STATUS follow Google's Cast message docs; they are not
+yet read back from the real Hub.
 """
 import argparse
 import json
@@ -56,6 +63,8 @@ from zeroconf import ServiceInfo, Zeroconf
 NS_CONNECTION = 'urn:x-cast:com.google.cast.tp.connection'
 NS_HEARTBEAT = 'urn:x-cast:com.google.cast.tp.heartbeat'
 NS_RECEIVER = 'urn:x-cast:com.google.cast.receiver'
+NS_MEDIA = 'urn:x-cast:com.google.cast.media'
+APPS = {'CC1AD845': 'Default Media Receiver'}
 
 
 def f32(x):
@@ -75,6 +84,8 @@ class FakeCastDevice:
         self.level, self.muted = 1.0, False
         self.no_pong, self.delay, self.ignore_set_volume = False, 0.0, False
         self.clamp_max, self.round_step = None, None
+        self.app_id, self.session_id = None, None
+        self.load, self.player_state = None, None  # load: the LOAD's media dict
         self.conns = {}  # socket -> send lock
         self.zc, self.info, self.listener = Zeroconf(), None, None
         self.log = []
@@ -112,6 +123,9 @@ class FakeCastDevice:
             return {'level': self.level, 'muted': self.muted, 'no_pong': self.no_pong,
                     'delay': self.delay, 'ignore_set_volume': self.ignore_set_volume,
                     'clamp_max': self.clamp_max, 'round_step': self.round_step,
+                    'app_id': self.app_id, 'player_state': self.player_state,
+                    'load': self.load and {k: self.load.get(k) for k in
+                                           ('contentId', 'contentType', 'streamType')},
                     'advertised': self.info is not None, 'host': self.host, 'port': self.port,
                     'connections': len(self.conns), 'log': self.log[-20:]}
 
@@ -223,8 +237,8 @@ class FakeCastDevice:
                 pass
         threading.Timer(delay, go).start() if delay else go()
 
-    def reply(self, conn, req, namespace, payload):
-        msg = CastMessage(protocol_version=0, source_id='receiver-0', destination_id=req.source_id,
+    def reply(self, conn, req, namespace, payload, source='receiver-0'):
+        msg = CastMessage(protocol_version=0, source_id=source, destination_id=req.source_id,
                           namespace=namespace, payload_type=CastMessage.STRING,
                           payload_utf8=json.dumps(payload))
         self.send(conn, msg)
@@ -234,15 +248,32 @@ class FakeCastDevice:
             # Shape read from a real Nest Hub by cast_readback.py (2026-10-17) while it was casting:
             # no isActiveInput/isStandBy, floats are float32, controlType is 'master'. Its
             # `applications` held the Default Media Receiver; an idle Hub's list is unverified.
+            apps = [{'appId': self.app_id, 'displayName': APPS[self.app_id], 'isIdleScreen': False,
+                     'namespaces': [{'name': NS_MEDIA}], 'sessionId': self.session_id,
+                     'statusText': APPS[self.app_id], 'transportId': self.session_id}
+                    ] if self.app_id else []
             return {'requestId': request_id, 'type': 'RECEIVER_STATUS', 'status': {
-                'applications': [], 'version': 2, 'userEq': USER_EQ,
+                'applications': apps, 'version': 2, 'userEq': USER_EQ,
                 'volume': {'controlType': 'master', 'level': f32(self.level),
                            'muted': self.muted, 'stepInterval': f32(0.02)}}}
+
+    def media_status(self, request_id):
+        with self.lock:
+            status = [{'mediaSessionId': 1, 'playbackRate': 1, 'playerState': self.player_state,
+                       'currentTime': 0, 'supportedMediaCommands': 0,
+                       'volume': {'level': 1, 'muted': False}, 'media': self.load}
+                      ] if self.load else []
+            return {'requestId': request_id, 'type': 'MEDIA_STATUS', 'status': status}
 
     def broadcast(self):
         """Unsolicited status to every sender, as a Hub sends after a button press."""
         for conn in list(self.conns):
             self.reply(conn, CastMessage(source_id='sender-0'), NS_RECEIVER, self.status(0))
+
+    def broadcast_media(self):
+        for conn in list(self.conns):
+            self.reply(conn, CastMessage(source_id='*'), NS_MEDIA, self.media_status(0),
+                       self.session_id)
 
     def handle(self, conn, msg):
         data = json.loads(msg.payload_utf8)
@@ -268,6 +299,24 @@ class FakeCastDevice:
                 if 'muted' in vol:
                     self.muted = bool(vol['muted'])
             self.reply(conn, msg, NS_RECEIVER, self.status(rid))
+        elif msg.namespace == NS_RECEIVER and kind == 'LAUNCH':
+            self.note(f'LAUNCH {data.get("appId")}')
+            if data.get('appId') not in APPS:
+                self.reply(conn, msg, NS_RECEIVER, {'requestId': rid, 'type': 'LAUNCH_ERROR',
+                                                    'reason': 'NOT_FOUND'})
+                return
+            with self.lock:
+                self.app_id, self.session_id = data['appId'], str(uuidlib.uuid4())
+                self.load = self.player_state = None
+            self.reply(conn, msg, NS_RECEIVER, self.status(rid))
+        elif msg.namespace == NS_MEDIA and kind == 'GET_STATUS':
+            self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
+        elif msg.namespace == NS_MEDIA and kind == 'LOAD':
+            media = data.get('media', {})
+            self.note(f'LOAD {media.get("contentId")} {media.get("contentType")}')
+            with self.lock:
+                self.load, self.player_state = media, 'PLAYING'
+            self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
         # tp.connection CONNECT/CLOSE get no reply on a real device; anything else is ignored.
 
 
