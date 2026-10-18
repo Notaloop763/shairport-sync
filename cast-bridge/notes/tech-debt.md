@@ -20,10 +20,11 @@ FLUSH; AP2 `FLUSHBUFFERED` stops playback silently (`rtsp.c:1430-1450`). Without
 bridge can't apply the "resume after a flush re-LOADs" rule, and the Hub would replay the old
 track's buffered tail after a skip. Fix, Walter's choice: carry a receiver patch,
 `receiver/ap2-flush-metadata`, that sends `pfls` from the AP2 flush-all path.
-- A draft commit exists on that branch (2026-10-18): unbuilt, untested, unmerged.
-- Carrying it means building our own receiver image, as we already do for the bridge
-  (`prototype-<n>` tags), and switching `compose.yaml` off the `mikebrady/shairport-sync`
-  digest to that image.
+- Done 2026-10-18: the patch builds (AirPlay 2 and classic, no warnings), passed an iPhone
+  test on the laptop (`architecture.md` "What an iPhone actually sends"), and is merged into
+  `bridge`.
+- Left: build our own receiver image, as we already do for the bridge (`prototype-<n>`
+  tags), and switch `compose.yaml` off the `mikebrady/shairport-sync` digest to it.
 - It is a candidate upstream PR; open one only when Walter says (`UPSTREAMING.md`).
 - Retired when upstream ships an equivalent and we're back on an upstream image.
 
