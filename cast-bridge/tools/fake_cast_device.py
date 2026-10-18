@@ -20,6 +20,8 @@ What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages tha
                                                                 HTTP GET of the LOAD URL,
                                                                 as the Hub pulls the stream fake: pulled
                   media_controller.status                       media GET_STATUS           fake: answered
+  handle()        media_controller.pause() / play()             media PAUSE / PLAY         fake: answered;
+                                                                a paused fake stops reading the stream
                   cast_info.friendly_name / host / model_name   mDNS TXT                   fake: advertised
   apply_volume()  cast.status.volume_level / volume_muted       cached RECEIVER_STATUS     fake: answered
                   cast.set_volume(level)                        receiver SET_VOLUME {volume:{level}}
@@ -343,6 +345,9 @@ class FakeCastDevice:
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
                 while not stop.is_set():
+                    if self.player_state == 'PAUSED':  # a paused Hub stops reading its socket
+                        time.sleep(0.05)
+                        continue
                     chunk = resp.read1(4096)
                     if not chunk:
                         break
@@ -350,8 +355,9 @@ class FakeCastDevice:
                         if stop.is_set():
                             break  # checked under the lock so a stop's IDLE is not overwritten
                         self.capture += chunk
-                        first = self.player_state != 'PLAYING'
-                        self.player_state = 'PLAYING'
+                        first = self.player_state not in ('PLAYING', 'PAUSED')  # one read may land after PAUSE
+                        if first:
+                            self.player_state = 'PLAYING'
                     if first:
                         self.note(f'stream playing from {url}')
                         self.broadcast_media()
@@ -449,6 +455,11 @@ class FakeCastDevice:
                 self.pull_stop.set()
                 self.pull_stop = threading.Event()
             threading.Thread(target=self.pull, args=(url, self.pull_stop), daemon=True).start()
+            self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
+        elif msg.namespace == NS_MEDIA and kind in ('PAUSE', 'PLAY') and self.load:
+            self.note(kind)
+            with self.lock:
+                self.player_state = 'PAUSED' if kind == 'PAUSE' else 'PLAYING'
             self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
         # tp.connection CONNECT/CLOSE get no reply on a real device; anything else is ignored.
 

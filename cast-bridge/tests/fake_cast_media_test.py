@@ -20,6 +20,7 @@ def until(cond,timeout):
     return False
 feed=bridge.feed_pcm
 bridge.feed_pcm=lambda proc,path:feed(proc,fifo)  # main() hard-codes /audio/pcm
+bridge.read_events=lambda path,handle:None  # nor /audio/metadata; airplay_events_test.py covers it
 # Startup with the Hub not on the network: the first discovery fails after 20 s and main() retries
 # 5 s later instead of exiting.
 dev.configure({'withdraw':True})
