@@ -17,6 +17,8 @@ What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages tha
                                                                 tp.connection CONNECT to
                                                                 the app's transportId      fake: no reply, as real
                   media_controller.play_media()                 media LOAD                 fake: answered
+                                                                HTTP GET of the LOAD URL,
+                                                                as the Hub pulls the stream fake: pulled
                   media_controller.status                       media GET_STATUS           fake: answered
                   cast_info.friendly_name / host / model_name   mDNS TXT                   fake: advertised
   apply_volume()  cast.status.volume_level / volume_muted       cached RECEIVER_STATUS     fake: answered
@@ -42,6 +44,10 @@ Faults, settable at startup (flags) or at runtime: POST JSON to http://127.0.0.1
 GET / (any path, e.g. /state) returns the current state as JSON, including the launched App ID
 and the LOAD's URL and content type.
 
+On LOAD the fake GETs the URL and keeps every byte in `capture`; playerState goes BUFFERING, then
+PLAYING on the first bytes, then IDLE (idleReason ERROR) if the stream ends. It refuses to fetch
+anything but loopback, so its runs stay off the LAN.
+
 MEDIA_STATUS and the app entry in RECEIVER_STATUS follow Google's Cast message docs; they are not
 yet read back from the real Hub.
 """
@@ -54,6 +60,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -85,7 +93,9 @@ class FakeCastDevice:
         self.no_pong, self.delay, self.ignore_set_volume = False, 0.0, False
         self.clamp_max, self.round_step = None, None
         self.app_id, self.session_id = None, None
-        self.load, self.player_state = None, None  # load: the LOAD's media dict
+        self.load, self.player_state, self.idle_reason = None, None, None  # load: the LOAD's media
+        # shortcut: capture grows ~24 kB/s at 192 kbit/s without bound; cap it if runs get long.
+        self.capture, self.pull_stop = bytearray(), threading.Event()
         self.conns = {}  # socket -> send lock
         self.zc, self.info, self.listener = Zeroconf(), None, None
         self.log = []
@@ -126,7 +136,7 @@ class FakeCastDevice:
                     'app_id': self.app_id, 'player_state': self.player_state,
                     'load': self.load and {k: self.load.get(k) for k in
                                            ('contentId', 'contentType', 'streamType')},
-                    'advertised': self.info is not None, 'host': self.host, 'port': self.port,
+                    'capture_bytes': len(self.capture), 'advertised': self.info is not None, 'host': self.host, 'port': self.port,
                     'connections': len(self.conns), 'log': self.log[-20:]}
 
     def configure(self, cmd):
@@ -263,6 +273,8 @@ class FakeCastDevice:
                        'currentTime': 0, 'supportedMediaCommands': 0,
                        'volume': {'level': 1, 'muted': False}, 'media': self.load}
                       ] if self.load else []
+            if status and self.idle_reason:
+                status[0]['idleReason'] = self.idle_reason
             return {'requestId': request_id, 'type': 'MEDIA_STATUS', 'status': status}
 
     def broadcast(self):
@@ -274,6 +286,31 @@ class FakeCastDevice:
         for conn in list(self.conns):
             self.reply(conn, CastMessage(source_id='*'), NS_MEDIA, self.media_status(0),
                        self.session_id)
+
+    # --- media stream -----------------------------------------------------------------------
+    def pull(self, url, stop):
+        """GET the LOAD URL as the Hub does and keep the bytes until stopped or the stream ends."""
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                while not stop.is_set():
+                    chunk = resp.read1(4096)
+                    if not chunk:
+                        break
+                    with self.lock:
+                        self.capture += chunk
+                        first = self.player_state != 'PLAYING'
+                        self.player_state = 'PLAYING'
+                    if first:
+                        self.note(f'stream playing from {url}')
+                        self.broadcast_media()
+        except OSError as exc:
+            self.note(f'stream error {exc!r}')
+        if stop.is_set():
+            return  # a newer LOAD or LAUNCH took over
+        with self.lock:
+            self.player_state, self.idle_reason = 'IDLE', 'ERROR'
+        self.note('stream ended')
+        self.broadcast_media()
 
     def handle(self, conn, msg):
         data = json.loads(msg.payload_utf8)
@@ -307,15 +344,24 @@ class FakeCastDevice:
                 return
             with self.lock:
                 self.app_id, self.session_id = data['appId'], str(uuidlib.uuid4())
-                self.load = self.player_state = None
+                self.load = self.player_state = self.idle_reason = None
+                self.pull_stop.set()
             self.reply(conn, msg, NS_RECEIVER, self.status(rid))
         elif msg.namespace == NS_MEDIA and kind == 'GET_STATUS':
             self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
         elif msg.namespace == NS_MEDIA and kind == 'LOAD':
             media = data.get('media', {})
-            self.note(f'LOAD {media.get("contentId")} {media.get("contentType")}')
+            url = media.get('contentId', '')
+            self.note(f'LOAD {url} {media.get("contentType")}')
+            if not (urllib.parse.urlsplit(url).hostname or '').startswith('127.'):
+                self.reply(conn, msg, NS_MEDIA, {'requestId': rid, 'type': 'LOAD_FAILED'},
+                           self.session_id)
+                return
             with self.lock:
-                self.load, self.player_state = media, 'PLAYING'
+                self.load, self.player_state, self.idle_reason = media, 'BUFFERING', None
+                self.pull_stop.set()
+                self.pull_stop = threading.Event()
+            threading.Thread(target=self.pull, args=(url, self.pull_stop), daemon=True).start()
             self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
         # tp.connection CONNECT/CLOSE get no reply on a real device; anything else is ignored.
 
