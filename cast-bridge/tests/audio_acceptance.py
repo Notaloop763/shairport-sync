@@ -29,7 +29,10 @@ FLOOR_DB, PURITY, MATCH = -50, .6, .03
 UNCERTAINTY = WIN / 2 / RATE + .02  # half a frame plus one playout tick, before tick lateness
 # Integrity limits hold for any receiver: the harness's own expectations of the synthetic fixture.
 INTEGRITY = {'max_gap_s': .06, 'duration_error_s': .15, 'level_error_db': 1.5, 'mute_below_dbfs': -60,
-             'latency_growth_s': .15, 'origin': 'synthetic fixture expectation'}
+             'latency_growth_s': .15, 'origin': 'synthetic fixture expectation',
+             # The encoder holds ~70 ms until the 0.5 s keepalive: a short last run after a pause is
+             # reported as `tail`, not a dropout (tech-debt.md item 13).
+             'held_tail': {'max_s': .25, 'max_gap_s': .6}}
 # shortcut: no latency budget is agreed yet; these are proposals for Walter, from the reference baseline.
 BUDGET = {'start_s': 1.0, 'pause_s': 1.0, 'volume_s': .5,
           'origin': 'proposed by Claude from the reference-profile baseline; not approved by Walter'}
@@ -133,9 +136,13 @@ def analyze(y, t0, events, late_max=0.0):
             bad.append(f'marker {k} ({MARKERS[k]} Hz) never reached the output')
             continue
         r = runs[k]
+        t_max, g_max = INTEGRITY['held_tail']['max_s'], INTEGRITY['held_tail']['max_gap_s']
+        if end_kind == 'pause' and len(r) > 1 and r[-1][1] - r[-1][0] <= t_max and r[-1][0] - r[-2][1] <= g_max:
+            tail = r.pop()
+            rec['tail'] = {'gap_s': round(tail[0] - r[-1][1], 3), 'length_s': round(tail[1] - tail[0] + HOP / RATE, 3)}
         rec['start_latency_s'] = round(r[0][0] - first['first_write'], 3)
         rec['end_latency_s'] = round(r[-1][1] - last['last_write'], 3)
-        rec['output_s'] = round(r[-1][1] - r[0][0] + HOP / RATE, 3)
+        rec['output_s'] = round(r[-1][1] - r[0][0] + HOP / RATE + rec.get('tail', {}).get('length_s', 0), 3)  # audio heard, not the held gap
         others = [s for j, rr in runs.items() if j != k for s, _ in rr]
         for (_, e1), (s2, _) in zip(r, r[1:]):
             if any(e1 < s < s2 for s in others):
