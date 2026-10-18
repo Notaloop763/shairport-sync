@@ -33,7 +33,7 @@ repo at `upstream/development` 380e6b1b.
 |---|---|---|
 | Pause, rate 0 (`paus`, `rtsp.c:1577`) | Cast PAUSE immediately | step 1 |
 | Resume, rate 1 (`pres`, `rtsp.c:1562`) | PLAY; re-LOAD instead after a flush or a pause over 30 s | step 1 |
-| Flush-all (**no event**, see below) | Cast PAUSE; mark the next resume as needing a re-LOAD | step 1, blocked |
+| Flush-all (**no event**, see below) | Cast PAUSE; mark the next resume as needing a re-LOAD | step 1, needs the receiver patch |
 | Session begin/end (`pbeg`/`pend`, `player.c:5513`/`5558`) | LOAD / let the recovery loop own it | step 1 |
 | Volume (`pvol`, `player.c:5193`; today the curl hook) | SET_VOLUME through the existing worker, cap honoured | done (hook) |
 | Metadata block (`mdst`…`mden`, `rtsp.c:3367`; `PICT` artwork) | update Cast metadata without a re-LOAD | step 2 |
@@ -43,10 +43,9 @@ repo at `upstream/development` 380e6b1b.
 `FLUSHBUFFERED` (`rtsp.c:1430-1450`) sets flags and stops playback with no metadata. `prsm`
 is deprecated and AP2 buffered audio uses `paus`/`pres` (`metadata/core.c:88-94`). Without a
 flush event, step 1 must either re-LOAD on every resume (costs startup lag each time) or PLAY
-on every resume (after a skip the Hub plays out the old track's buffered tail). The clean fix
-is a `receiver/ap2-flush-metadata` topic that sends `pfls` from the AP2 flush-all path:
-small, matches the documented meaning of `pfls`, and fit for upstream. Walter decides
-which; `pdis` (timestamp discontinuity) might also mark a skip, untested.
+on every resume (after a skip the Hub plays out the old track's buffered tail). Walter chose
+a receiver patch instead (2026-10-18): `receiver/ap2-flush-metadata` sends `pfls` from the
+AP2 flush-all path. Tracked in `tech-debt.md`.
 
 | Cast event (Hub touch, voice, Home app) | AirPlay command (MQTT `<topic>/remote`) | Status |
 |---|---|---|
@@ -141,7 +140,19 @@ receivers. Checked against Shairport (independently reverse-engineered, hardware
 | Receiver pauses locally before forwarding a pause (§1, §5) | PlayOnAir tests it (`bridge/remote.rs:182`); not checkable here | plausible |
 | "What the fork does" notes | Volume note is stale: PlayOnAir now uses `(dB + 30) / 30` (`airplay/mod.rs:955`) | stale |
 
-PTP, advertising and multizone sections weren't checked; we don't depend on them.
+Unchecked, because nothing in the plan depends on them yet. When a question touches one of
+these, start at the section listed here:
+
+| Topic | Where (`~/Projects/ref/play-on-air/`) |
+|---|---|
+| Buffered playout timing: SETRATEANCHORTIME, anchors, buffer limits | `docs/ap2-receiver-spec.md` §1, line 42 |
+| PTP clock: peers, master election, lock | `docs/ap2-receiver-spec.md` §3, line 287 |
+| Advertising: feature mask, `statusFlags`, `/info` keys, TXT records, an audio-only mask | `docs/ap2-receiver-spec.md` §4, line 358 |
+| Cast multi-room (dynamic groups): capability bits, `MULTIZONE_STATUS`, `SET_PLAYBACK_DEVICES`, per-member volume, LIVE DMR sessions | `docs/cast-multizone-spec.md` (Messages line 120, Operations line 196); code in `crates/play-on-air/src/cast/multizone.rs`, `bridge/group.rs` |
+| Why Apple multi-room can't include a Cast speaker | `VISION.md:35`, `README.md:95` |
+
+The clock question is settled for us: Cast takes no Apple PTP timing, so the bridge never
+syncs clocks with the iPhone or HomePods; the release lead under "Delivery" replaces it.
 
 ## Open questions
 
