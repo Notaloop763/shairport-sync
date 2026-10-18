@@ -61,6 +61,19 @@ PLAYING on the first bytes, then IDLE (idleReason ERROR) if the stream ends. It 
 anything but loopback, so its runs stay off the LAN. listen(capture) decodes and measures it (needs
 ffmpeg and numpy), so a test can tell whether the right audio arrived.
 
+Playout (profile='reference' or 'delayed-7s', see PROFILES; needs ffmpeg and numpy): the pulled MP3
+is also decoded into a queue, and a 20 ms playout clock takes blocks from it, applies the device's
+gain as it stands at render time (GAIN_LAW), and appends them to `output`, 16-bit mono at
+PLAYOUT_RATE starting at monotonic time `output_t0`. PLAYING still follows the first bytes, as it
+does on a real device, so `output` is the only evidence of what was heard. Playout faults:
+  {"silent_output": true}        render silence whatever arrives
+  {"control_delay": 2.0}         volume reaches the output N s after SET_VOLUME (the reply is not
+                                 delayed); a huge value is a volume ack that never affects output
+  {"gain_at_enqueue": true}      apply gain as audio enters the queue rather than as it plays
+  {"render_rate": 0.98}          the playout clock consumes audio this much slower than real time
+  {"dropout": 0.5}               zero the next N s of output, once
+  {"replay": 2.0}                play the last N s of output again, once
+
 MEDIA_STATUS and the app entry in RECEIVER_STATUS follow Google's Cast message docs; they are not
 yet read back from the real Hub.
 """
@@ -93,6 +106,15 @@ def f32(x):
     return struct.unpack('f', struct.pack('f', x))[0]
 
 
+# Receiver playout models, version 1. None is calibrated against a real Hub: 'delayed-7s' reproduces
+# the class of Walter's report (start/pause ~7 s late, volume prompt), not its cause.
+PROFILES = {
+    'reference': {'version': 1, 'buffer_s': 0.2, 'rebuffer_s': 0.2, 'max_backlog_s': 2.0, 'calibrated': False},
+    'delayed-7s': {'version': 1, 'buffer_s': 7.0, 'rebuffer_s': 7.0, 'max_backlog_s': 10.0, 'calibrated': False},
+}
+PLAYOUT_RATE = 48000
+GAIN_LAW = 'amplitude x level, x0 when muted (simulated; a real Hub\'s curve is unmeasured)'
+
 USER_EQ = {'high_shelf': {'frequency': 4500, 'gain_db': 6.0, 'quality': 0.707},
            'low_shelf': {'frequency': 150, 'gain_db': f32(-2.16), 'quality': 0.707},
            'max_peaking_eqs': 0, 'peaking_eqs': []}
@@ -119,7 +141,7 @@ def listen(mp3):
 
 
 class FakeCastDevice:
-    def __init__(self, uuid, name, model, port, host, control_port=8010, **faults):
+    def __init__(self, uuid, name, model, port, host, control_port=8010, profile=None, **faults):
         self.uuid, self.name, self.model = uuid, name, model
         self.host, self.port = host, port
         self.lock = threading.RLock()
@@ -133,6 +155,14 @@ class FakeCastDevice:
         # shortcut: capture grows ~24 kB/s at 192 kbit/s without bound; cap it if runs get long.
         self.capture, self.pull_stop = bytearray(), threading.Event()
         self.conns = {}  # socket -> send lock
+        self.profile, self.gains = profile, [(time.monotonic(), self.level, self.muted)]
+        self.silent_output, self.gain_at_enqueue, self.control_delay, self.render_rate = False, False, 0.0, 1.0
+        self.dropout = self.replay = 0.0
+        # shortcut: output grows 96 kB/s and history stays 10 s; cap output if runs get long.
+        self.queue, self.output, self.history, self.output_t0 = bytearray(), bytearray(), bytearray(), None
+        self.buffering, self.started = True, False
+        self.decoded = self.rendered = self.underruns = self.dropped = 0  # samples, but underruns
+        self.late_max, self.playout_log = 0.0, []  # every 0.5 s: t, received bytes, decoded/queued/rendered s
         # A loopback fake announces on loopback only, so its mDNS never reaches the LAN.
         self.zc = Zeroconf(interfaces=['127.0.0.1'] if host.startswith('127.') else InterfaceChoice.All)
         self.info, self.listener = None, None
@@ -164,6 +194,8 @@ class FakeCastDevice:
                 self.reply(200)
         self.control = ThreadingHTTPServer(('127.0.0.1', control_port), Control)
         threading.Thread(target=self.control.serve_forever, daemon=True).start()
+        if profile:
+            threading.Thread(target=self.render, daemon=True).start()
 
     # --- state and faults -------------------------------------------------------------------
     def state(self):
@@ -177,17 +209,31 @@ class FakeCastDevice:
                     'load': self.load and {k: self.load.get(k) for k in
                                            ('contentId', 'contentType', 'streamType')},
                     'capture_bytes': len(self.capture), 'advertised': self.info is not None, 'host': self.host, 'port': self.port,
-                    'connections': len(self.conns), 'log': self.log[-20:]}
+                    'connections': len(self.conns), 'log': self.log[-20:],
+                    'playout': self.profile and self.playout()}
+
+    def playout(self):
+        with self.lock:
+            return {'profile': self.profile, **PROFILES[self.profile], 'gain_law': GAIN_LAW,
+                    'silent_output': self.silent_output, 'control_delay': self.control_delay,
+                    'gain_at_enqueue': self.gain_at_enqueue, 'render_rate': self.render_rate,
+                    'received_bytes': len(self.capture), 'decoded_s': self.decoded / PLAYOUT_RATE,
+                    'queued_s': len(self.queue) / 2 / PLAYOUT_RATE,
+                    'rendered_s': self.rendered / PLAYOUT_RATE,
+                    'output_s': len(self.output) / 2 / PLAYOUT_RATE, 'underruns': self.underruns,
+                    'dropped_s': self.dropped / PLAYOUT_RATE, 'late_max_s': round(self.late_max, 4)}
 
     def configure(self, cmd):
         for key in ('no_pong', 'delay', 'ignore_set_volume', 'clamp_max', 'round_step',
-                    'load_error', 'launch_delay', 'volume_cap'):
+                    'load_error', 'launch_delay', 'volume_cap', 'silent_output', 'control_delay',
+                    'gain_at_enqueue', 'render_rate', 'dropout', 'replay'):
             if key in cmd:
                 setattr(self, key, cmd[key])
         if 'set_level' in cmd or 'set_muted' in cmd:
             with self.lock:
                 self.level = float(cmd.get('set_level', self.level))
                 self.muted = bool(cmd.get('set_muted', self.muted))
+                self.gains.append((time.monotonic(), self.level, self.muted))
             self.broadcast()
         if cmd.get('stop_stream'):
             self.pull_stop.set()
@@ -342,6 +388,16 @@ class FakeCastDevice:
     # --- media stream -----------------------------------------------------------------------
     def pull(self, url, stop):
         """GET the LOAD URL as the Hub does and keep the bytes until stopped or the stream ends."""
+        dec = None
+        if self.profile:
+            with self.lock:  # a new stream buffers from empty, as after a LOAD
+                self.queue.clear()
+                self.buffering, self.started = True, False
+            dec = subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-probesize', '32',
+                                    '-analyzeduration', '0', '-f', 'mp3', '-i', 'pipe:0', '-ac', '1',
+                                    '-ar', str(PLAYOUT_RATE), '-flush_packets', '1', '-f', 's16le', 'pipe:1'],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+            threading.Thread(target=self.decode, args=(dec, stop), daemon=True).start()
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:
                 while not stop.is_set():
@@ -358,13 +414,95 @@ class FakeCastDevice:
                         first = self.player_state not in ('PLAYING', 'PAUSED')  # one read may land after PAUSE
                         if first:
                             self.player_state = 'PLAYING'
+                    if dec:
+                        dec.stdin.write(chunk)
                     if first:
                         self.note(f'stream playing from {url}')
                         self.broadcast_media()
         except OSError as exc:
             self.note(f'stream error {exc!r}')
+        if dec:
+            dec.stdin.close()
         if not stop.is_set():  # else a newer LOAD, LAUNCH or stop_stream took over
             self.stream_ended('stream ended')
+
+    def decode(self, dec, stop):
+        import numpy as np
+        rest = b''
+        while data := dec.stdout.read(8192):
+            data, rest = rest + data, b''
+            if len(data) % 2:
+                data, rest = data[:-1], data[-1:]
+            if self.gain_at_enqueue:
+                x = np.frombuffer(data, '<i2') * self.gain_at(time.monotonic() - self.control_delay)
+                data = x.astype('<i2').tobytes()
+            with self.lock:
+                if stop.is_set():
+                    break  # a newer stream owns the queue
+                self.queue += data
+                self.decoded += len(data) // 2
+        dec.kill()
+        dec.wait()
+
+    def gain_at(self, t):
+        """GAIN_LAW applied to the device's volume as it stood at monotonic time t."""
+        with self.lock:
+            level, muted = next((lv, m) for ts, lv, m in reversed(self.gains) if ts <= t) \
+                if t >= self.gains[0][0] else self.gains[0][1:]
+        return 0.0 if muted else level
+
+    def render(self):
+        """Playout clock: every 20 ms take a block from the queue, apply the gain as it stands now
+        and append it to `output`; silence while buffering or after an underrun."""
+        import numpy as np
+        block, p = PLAYOUT_RATE // 50, PROFILES[self.profile]
+        self.output_t0 = time.monotonic()
+        n = 0
+        while True:
+            n += 1
+            late = time.monotonic() - (self.output_t0 + n / 50)
+            if late < 0:
+                time.sleep(-late)
+            else:
+                self.late_max = max(self.late_max, late)
+            want = round(block * self.render_rate)
+            with self.lock:
+                if self.replay:
+                    self.queue[:0] = self.history[-int(self.replay * PLAYOUT_RATE) * 2:]
+                    self.note(f'replaying the last {self.replay} s'); self.replay = 0.0
+                excess = len(self.queue) // 2 - int(p['max_backlog_s'] * PLAYOUT_RATE)
+                if excess > 0:
+                    del self.queue[:excess * 2]
+                    self.dropped += excess
+                depth = len(self.queue) // 2
+                if self.buffering and depth >= (p['rebuffer_s'] if self.started else p['buffer_s']) * PLAYOUT_RATE:
+                    self.buffering, self.started = False, True
+                elif not self.buffering and depth < want:
+                    self.buffering = True
+                    self.underruns += 1
+                if self.buffering:
+                    x = np.zeros(block)
+                else:
+                    raw = bytes(self.queue[:want * 2])
+                    del self.queue[:want * 2]
+                    self.history += raw
+                    del self.history[:-10 * PLAYOUT_RATE * 2]
+                    self.rendered += want
+                    x = np.frombuffer(raw, '<i2').astype(float)
+                    if want != block:
+                        x = np.interp(np.arange(block) * want / block, np.arange(want), x)
+                    if self.dropout > 0:
+                        k = min(block, round(self.dropout * PLAYOUT_RATE))
+                        x[:k] = 0
+                        self.dropout -= k / PLAYOUT_RATE
+                gain = 1.0 if self.gain_at_enqueue else self.gain_at(time.monotonic() - self.control_delay)
+                if self.silent_output:
+                    gain = 0.0
+                self.output += (x * gain).astype('<i2').tobytes()
+                if n % 25 == 0:
+                    self.playout_log.append((round(time.monotonic() - self.output_t0, 2), len(self.capture),
+                                             self.decoded / PLAYOUT_RATE, depth / PLAYOUT_RATE,
+                                             self.rendered / PLAYOUT_RATE))
 
     def stream_ended(self, why):
         with self.lock:
@@ -430,6 +568,7 @@ class FakeCastDevice:
                     self.level = round(min(max(level, 0.0), 1.0), 4)
                 if 'muted' in vol:
                     self.muted = bool(vol['muted'])
+                self.gains.append((time.monotonic(), self.level, self.muted))
             self.reply(conn, msg, NS_RECEIVER, self.status(rid))
         elif msg.namespace == NS_RECEIVER and kind == 'LAUNCH':
             self.note(f'LAUNCH {data.get("appId")}')
@@ -480,12 +619,13 @@ def main():
     p.add_argument('--load-error', action='store_true', default=None)
     p.add_argument('--launch-delay', type=float)
     p.add_argument('--volume-cap', type=float)
+    p.add_argument('--profile', choices=PROFILES)
     a = p.parse_args()
     dev = FakeCastDevice(uuidlib.UUID(a.uuid), a.name, a.model, a.port, a.host, a.control_port,
                          no_pong=a.no_pong, delay=a.delay, ignore_set_volume=a.ignore_set_volume,
                          clamp_max=a.clamp_max, round_step=a.round_step,
                          load_error=a.load_error, launch_delay=a.launch_delay,
-                         volume_cap=a.volume_cap)
+                         volume_cap=a.volume_cap, profile=a.profile)
     print(f'fake cast {a.uuid} "{a.name}" on {a.host}:{a.port}, control http://127.0.0.1:{a.control_port}/',
           flush=True)
     threading.Event().wait()
