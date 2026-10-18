@@ -265,13 +265,6 @@ def connect(uuid):
     return cast, browser
 
 
-def cast_audio(host, uuid, stream):
-    cast, browser = connect(uuid)
-    load_stream(cast, stream)
-    # Keep the Cast connection and discovery browser alive for this process.
-    return cast, browser
-
-
 def load_stream(cast, stream):
     # Preserve the user's current device volume across bridge restarts.
     cast.media_controller.launch()
@@ -337,7 +330,7 @@ def main():
     stream = f'http://{host}:{port}/live.mp3'
     # Walter's recovery policy: recast at once when the Hub drops our stream; when a person chose
     # something else, wait for new AirPlay audio. RECAST_ATTEMPTS tries, then wait for new audio.
-    target = browser = None
+    target = browser = None  # keep the Cast connection and discovery browser alive for this process
     lost_since, confirmed, wait_audio_since = time.monotonic(), True, None  # nothing cast yet
     attempts, next_try, playing_since = 0, 0.0, None
     while True:

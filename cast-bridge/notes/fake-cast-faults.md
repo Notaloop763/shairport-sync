@@ -38,7 +38,7 @@ budget. `main()` declares a loss after 10 s without PLAYING or BUFFERING of our 
 | Fault | Before | After (`fork/bridge-recovery`) | Verdict |
 |-------|--------|--------------------------------|---------|
 | Stream stops mid-play (`stop_stream`) | `IDLE` within 2 s, no reload: silent until restart | Recast 14 s after the stop, no AirPlay audio needed | Recovers |
-| LOAD answered with LOAD_FAILED (`load_error`) | `cast_audio()` raised after 22 s and `main()` exited | Each failed recast is logged (`RECAST_FAILURE`) and retried; after the last, `RECAST_GAVE_UP` and no more LOADs. New AirPlay audio recast it 8 s after play. Tested with 2 attempts, not 5 | Recovers |
+| LOAD answered with LOAD_FAILED (`load_error`) | Casting raised after 22 s and `main()` exited | Each failed recast is logged (`RECAST_FAILURE`) and retried; after the last, `RECAST_GAVE_UP` and no more LOADs. New AirPlay audio recast it 8 s after play. Tested with 2 attempts, not 5 | Recovers |
 | LAUNCH 8 s late (`launch_delay`) | A second LAUNCH from `play_media()`; casting after 11 s | Unchanged | Handled |
 | Another sender takes the Hub (`takeover`) | `UNKNOWN`, no reload: silent until restart | `CAST_LOST ... waiting_for_audio: true`; leaves Spotify alone for 20 s, recasts 8 s after AirPlay plays | Stays put, then recovers on AirPlay |
 | The app quits (`close_app`) | Same as takeover | Same as takeover, with no app | Stays put, then recovers on AirPlay |

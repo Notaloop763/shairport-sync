@@ -100,11 +100,11 @@ def fresh(n,**faults):
                           'Google Nest Hub',18109+100*n,'127.0.0.1',18110+100*n,**faults))
     return fakes[-1]
 d=fresh(2,launch_delay=8);t=time.monotonic()
-cast,_=bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
+cast,_=bridge.connect(str(d.uuid));bridge.load_stream(cast,stream)
 launches=sum('LAUNCH' in l for l in d.log)
 # play_media() relaunches when the app is not up yet 2 s after launch(), so two LAUNCHes.
 assert launches==2 and d.state()['player_state']=='PLAYING' and d.capture,d.log
-say('launch_delay',f'cast_audio succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
+say('launch_delay',f'casting succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
 # Another sender takes the Hub, or its app quits: pychromecast drops our media status to UNKNOWN
 # (never IDLE). A person chose this, so the bridge stays put until AirPlay plays again.
 for fault,app in (('takeover','CC32E753'),('close_app',None)):
