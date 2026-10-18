@@ -37,6 +37,8 @@ Faults, settable at startup (flags) or at runtime: POST JSON to http://127.0.0.1
   {"delay": 3.0}                 delay every reply by N seconds
   {"ignore_set_volume": true}    accept SET_VOLUME, change nothing, send no reply
   {"clamp_max": 0.4, "round_step": 0.05}   the device's own cap / quantisation of SET_VOLUME levels
+  {"volume_cap": 0.5}            CAST_VOLUME_CAP guard (default 0.5): a SET_VOLUME above it is
+                                 applied but recorded in cap_violations; check_cap() then raises
   {"set_level": 0.7, "set_muted": true}    a physical button: change state, push status to senders
   {"load_error": true}           answer every LOAD with LOAD_FAILED
   {"stop_stream": true}          stop pulling the stream now and report IDLE (idleReason ERROR)
@@ -118,6 +120,7 @@ class FakeCastDevice:
         self.no_pong, self.delay, self.ignore_set_volume = False, 0.0, False
         self.clamp_max, self.round_step = None, None
         self.load_error, self.launch_delay = False, 0.0
+        self.volume_cap, self.cap_violations = 0.5, []  # the Hub is in Walter's bedroom
         self.app_id, self.session_id = None, None
         self.load, self.player_state, self.idle_reason = None, None, None  # load: the LOAD's media
         # shortcut: capture grows ~24 kB/s at 192 kbit/s without bound; cap it if runs get long.
@@ -159,6 +162,7 @@ class FakeCastDevice:
             return {'level': self.level, 'muted': self.muted, 'no_pong': self.no_pong,
                     'delay': self.delay, 'ignore_set_volume': self.ignore_set_volume,
                     'clamp_max': self.clamp_max, 'round_step': self.round_step,
+                    'volume_cap': self.volume_cap, 'cap_violations': self.cap_violations,
                     'load_error': self.load_error, 'launch_delay': self.launch_delay,
                     'app_id': self.app_id, 'player_state': self.player_state,
                     'load': self.load and {k: self.load.get(k) for k in
@@ -168,7 +172,7 @@ class FakeCastDevice:
 
     def configure(self, cmd):
         for key in ('no_pong', 'delay', 'ignore_set_volume', 'clamp_max', 'round_step',
-                    'load_error', 'launch_delay'):
+                    'load_error', 'launch_delay', 'volume_cap'):
             if key in cmd:
                 setattr(self, key, cmd[key])
         if 'set_level' in cmd or 'set_muted' in cmd:
@@ -196,6 +200,10 @@ class FakeCastDevice:
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
             conn.close()
         self.note('dropped connections')
+
+    def check_cap(self):
+        """Fail the run if anything asked this device for more than volume_cap."""
+        assert not self.cap_violations, f'SET_VOLUME above cap {self.volume_cap}: {self.cap_violations}'
 
     def note(self, text):
         self.log.append(f'{time.strftime("%H:%M:%S")} {text}')
@@ -372,6 +380,9 @@ class FakeCastDevice:
             with self.lock:
                 if 'level' in vol:
                     level = float(vol['level'])
+                    if self.volume_cap is not None and level > self.volume_cap:
+                        self.cap_violations.append(level)
+                        self.note(f'CAP VIOLATION {level} > {self.volume_cap}')
                     if self.round_step:
                         level = round(level / self.round_step) * self.round_step
                     if self.clamp_max is not None:
@@ -423,11 +434,13 @@ def main():
     p.add_argument('--round-step', type=float)
     p.add_argument('--load-error', action='store_true', default=None)
     p.add_argument('--launch-delay', type=float)
+    p.add_argument('--volume-cap', type=float)
     a = p.parse_args()
     dev = FakeCastDevice(uuidlib.UUID(a.uuid), a.name, a.model, a.port, a.host, a.control_port,
                          no_pong=a.no_pong, delay=a.delay, ignore_set_volume=a.ignore_set_volume,
                          clamp_max=a.clamp_max, round_step=a.round_step,
-                         load_error=a.load_error, launch_delay=a.launch_delay)
+                         load_error=a.load_error, launch_delay=a.launch_delay,
+                         volume_cap=a.volume_cap)
     print(f'fake cast {a.uuid} "{a.name}" on {a.host}:{a.port}, control http://127.0.0.1:{a.control_port}/',
           flush=True)
     threading.Event().wait()

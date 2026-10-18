@@ -55,6 +55,18 @@ try: assert_tone(heard,1000,2)
 except AssertionError as exc: print('PASS silent input fails the tone check as intended: AssertionError',exc)
 else: raise AssertionError(f'silent input passed the tone check: {heard}')
 
+# Cap guard: the bridge's loudest ask stays at 0.5; a 0.6 sent past it must fail the run.
+bridge.request_airplay_volume(0)
+assert until(lambda:bridge.stats.get('volume_applied',{}).get('airplay_db')==0,10),bridge.stats
+assert dev.level==.5,dev.level;dev.check_cap()
+print('PASS AirPlay full volume reaches the fake as 0.5 and passes the cap guard')
+bridge.cast_target.set_volume(.6)
+try: dev.check_cap()
+except AssertionError as exc: print('PASS a 0.6 SET_VOLUME fails the cap guard as intended: AssertionError',exc)
+else: raise AssertionError(f'0.6 passed the cap guard: {dev.log[-3:]}')
+dev.cap_violations.clear();bridge.request_airplay_volume(-21)  # back to 0.3, inside the cap
+assert until(lambda:dev.level==.3,10),dev.level
+
 # Media faults. stop_stream hits the bridge's own cast; the others need a fresh cast_audio().
 T0=time.monotonic()
 def say(fault,text): print(f'[{time.monotonic()-T0:5.1f}s] FAULT {fault}: {text}',flush=True)
@@ -65,9 +77,11 @@ say('stop_stream',f"bridge saw {bridge.stats['cast']['state']}, clients={bridge.
 time.sleep(10);assert dev.player_state=='IDLE' and sum('LOAD' in l for l in dev.log)==1,dev.log
 say('stop_stream','10 s later the bridge has not reloaded: the Hub stays silent until bridge.py restarts')
 stream='http://127.0.0.1:18865/live.mp3'
+fakes=[]
 def fresh(n,**faults):
-    return FakeCastDevice(uuid.UUID(f'f4a1c0de-0000-4000-8000-0000000000b{n}'),f'Fake Hub {n}',
-                          'Google Nest Hub',18109+100*n,'127.0.0.1',18110+100*n,**faults)
+    fakes.append(FakeCastDevice(uuid.UUID(f'f4a1c0de-0000-4000-8000-0000000000b{n}'),f'Fake Hub {n}',
+                          'Google Nest Hub',18109+100*n,'127.0.0.1',18110+100*n,**faults))
+    return fakes[-1]
 d=fresh(1,load_error=True);t=time.monotonic()
 try: bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
 except RuntimeError as exc: say('load_error',f'cast_audio raised after {time.monotonic()-t:.0f}s: {exc!r:.80}')
@@ -79,3 +93,5 @@ launches=sum('LAUNCH' in l for l in d.log)
 # play_media() relaunches when the app is not up yet 2 s after launch(), so two LAUNCHes.
 assert launches==2 and d.state()['player_state']=='PLAYING' and d.capture,d.log
 say('launch_delay',f'cast_audio succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
+for d in (dev,*fakes): d.check_cap()
+print('PASS no SET_VOLUME above 0.5 reached any fake')
