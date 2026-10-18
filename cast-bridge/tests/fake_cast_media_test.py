@@ -122,5 +122,10 @@ for fault,app in (('takeover','CC32E753'),('close_app',None)):
     t=time.monotonic();play(tone(1000,1))
     assert until(lambda:playing(n+1),30),(bridge.stats['cast'],dev.log[-6:])
     say(fault,f'new AirPlay audio: recast and playing {time.monotonic()-t:.0f}s after play')
+# The Hub reboots: the connection drops and it comes back with no app. Nobody chose that, so the
+# bridge recasts with no AirPlay audio, unlike close_app above.
+n=loads();dev.configure({'close_app':True,'drop':True});t=time.monotonic()
+assert until(lambda:playing(n+1),40),(bridge.stats['cast'],dev.log[-6:])
+say('reboot',f'connection dropped and no app: recast {time.monotonic()-t:.0f}s later with no AirPlay audio')
 for d in (dev,*fakes): d.check_cap()
 print('PASS no SET_VOLUME above 0.5 reached any fake')

@@ -261,8 +261,16 @@ def connect(uuid):
         zconf.close()
         raise RuntimeError('Target Cast UUID not discovered')
     cast = casts[0]
+    cast.register_connection_listener(DropWatch())
     cast.wait(timeout=20)
     return cast, browser
+
+
+class DropWatch:
+    """Notes when the Cast connection drops, as it does when the Hub reboots or loses Wi-Fi."""
+    def new_connection_status(self, status):
+        if status.status != 'CONNECTED':
+            stats['cast_dropped_monotonic'] = time.monotonic()
 
 
 def load_stream(cast, stream):
@@ -349,12 +357,18 @@ def main():
             playing_since = None
             if lost_since is None:
                 lost_since, confirmed = now, False
+            if target and not target.socket_client.is_connected:
+                time.sleep(5)  # pychromecast is reconnecting; attempts now would only use up the budget
+                continue
             if not confirmed and now - lost_since >= LOST_AFTER:
                 confirmed = True
-                if chosen_elsewhere(target, status, stream):
+                # A drop resets the media status at once, so it lands within one poll before the loss.
+                dropped = stats.get('cast_dropped_monotonic', 0) >= lost_since - 5
+                if not dropped and chosen_elsewhere(target, status, stream):
                     wait_audio_since = lost_since
                 print('CAST_LOST', json.dumps({'state': status.player_state, 'idle_reason': status.idle_reason,
-                      'app_id': target.app_id, 'waiting_for_audio': wait_audio_since is not None}), flush=True)
+                      'app_id': target.app_id, 'dropped': dropped,
+                      'waiting_for_audio': wait_audio_since is not None}), flush=True)
             if confirmed and wait_audio_since is None and attempts >= RECAST_ATTEMPTS:
                 wait_audio_since = now
                 print('RECAST_GAVE_UP', json.dumps({'attempts': attempts}), flush=True)
