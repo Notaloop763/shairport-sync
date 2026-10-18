@@ -58,6 +58,15 @@ NS_HEARTBEAT = 'urn:x-cast:com.google.cast.tp.heartbeat'
 NS_RECEIVER = 'urn:x-cast:com.google.cast.receiver'
 
 
+def f32(x):
+    return struct.unpack('f', struct.pack('f', x))[0]
+
+
+USER_EQ = {'high_shelf': {'frequency': 4500, 'gain_db': 6.0, 'quality': 0.707},
+           'low_shelf': {'frequency': 150, 'gain_db': f32(-2.16), 'quality': 0.707},
+           'max_peaking_eqs': 0, 'peaking_eqs': []}
+
+
 class FakeCastDevice:
     def __init__(self, uuid, name, model, port, host, control_port=8010, **faults):
         self.uuid, self.name, self.model = uuid, name, model
@@ -78,7 +87,7 @@ class FakeCastDevice:
                         '-out', f'{self.certdir}/c.pem'], check=True, capture_output=True)
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.load_cert_chain(f'{self.certdir}/c.pem', f'{self.certdir}/k.pem')
-        self.listen(port)
+        self.listen(host, port)
         self.advertise(host, port)
         control = self
         class Control(BaseHTTPRequestHandler):
@@ -119,10 +128,10 @@ class FakeCastDevice:
             self.withdraw()
         if 'advertise' in cmd:
             adv = cmd['advertise'] or {}
-            port = int(adv.get('port', self.port))
-            if port != self.port:
-                self.listen(port)
-            self.advertise(adv.get('host', self.host), port)
+            host, port = adv.get('host', self.host), int(adv.get('port', self.port))
+            if (host, port) != (self.host, self.port):
+                self.listen(host, port)
+            self.advertise(host, port)
         if cmd.get('drop'):
             self.drop()
 
@@ -147,22 +156,26 @@ class FakeCastDevice:
         self.withdraw()
         self.host, self.port = host, port
         hexid = self.uuid.hex
-        props = {'id': hexid, 'fn': self.name, 'md': self.model, 'ca': '2052', 'st': '0',
-                 've': '05', 'nf': '1', 'rs': '', 'ic': '/setup/icon.png', 'bs': hexid[:12].upper()}
-        self.info = ServiceInfo('_googlecast._tcp.local.', f'FakeCast-{hexid}._googlecast._tcp.local.',
+        # TXT keys as a real Nest Hub advertises them (cd/rm/bs are opaque ids, made up here).
+        props = {'id': hexid, 'cd': hexid.upper(), 'rm': hexid[:16].upper(), 've': '05',
+                 'md': self.model, 'ic': '/setup/icon.png', 'fn': self.name, 'ca': '231941',
+                 'st': '0', 'bs': hexid[:12].upper(), 'nf': '1', 'rs': ''}
+        self.info = ServiceInfo('_googlecast._tcp.local.', f'Fake-Hub-{hexid}._googlecast._tcp.local.',
                                 addresses=[socket.inet_aton(host)], port=port, properties=props,
-                                server=f'{hexid}.local.')
+                                server=f'fuchsia-{hexid[:8]}.local.')
         self.zc.register_service(self.info)
         self.note(f'mDNS advertised {host}:{port}')
 
     # --- Cast wire --------------------------------------------------------------------------
-    def listen(self, port):
+    def listen(self, host, port):
         old, srv = self.listener, socket.socket()
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(('0.0.0.0', port)); srv.listen(8)
+        srv.bind((host, port)); srv.listen(8)
         self.listener = srv
         threading.Thread(target=self.accept, args=(srv,), daemon=True).start()
         if old:
+            # shutdown first: close() alone leaves a thread blocked in accept() holding the port open.
+            old.shutdown(socket.SHUT_RDWR)
             old.close()
 
     def accept(self, srv):
@@ -175,7 +188,7 @@ class FakeCastDevice:
             except OSError:
                 return  # listener closed
             self.conns[conn] = threading.Lock()
-            self.note('accepted connection')
+            self.note(f'accepted connection via {conn.getsockname()[0]}:{conn.getsockname()[1]}')
             threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
 
     def recv(self, conn, n):
@@ -218,10 +231,13 @@ class FakeCastDevice:
 
     def status(self, request_id):
         with self.lock:
+            # Shape read from a real Nest Hub by cast_readback.py (2026-10-17) while it was casting:
+            # no isActiveInput/isStandBy, floats are float32, controlType is 'master'. Its
+            # `applications` held the Default Media Receiver; an idle Hub's list is unverified.
             return {'requestId': request_id, 'type': 'RECEIVER_STATUS', 'status': {
-                'volume': {'controlType': 'attenuation', 'level': self.level,
-                           'muted': self.muted, 'stepInterval': 0.05},
-                'applications': [], 'isActiveInput': False, 'isStandBy': True}}
+                'applications': [], 'version': 2, 'userEq': USER_EQ,
+                'volume': {'controlType': 'master', 'level': f32(self.level),
+                           'muted': self.muted, 'stepInterval': f32(0.02)}}}
 
     def broadcast(self):
         """Unsolicited status to every sender, as a Hub sends after a button press."""
