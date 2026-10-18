@@ -41,7 +41,7 @@ services:
         max-size: "5m"
         max-file: "3"
   cast-bridge:
-    image: shairport-cast-bridge:prototype-9
+    image: shairport-cast-bridge:prototype-10
     container_name: shairport-cast-bridge
     network_mode: host
     restart: unless-stopped
@@ -71,5 +71,6 @@ configs:
         run_this_when_volume_is_set = "/usr/bin/curl --fail --silent --show-error --max-time 2 http://192.168.77.89:18765/airplay-volume --data ";
       };
       pipe = { name = "/audio/pcm"; };
+      metadata = { enabled = "yes"; include_cover_art = "no"; pipe_name = "/audio/metadata"; };
 volumes:
   audio:
