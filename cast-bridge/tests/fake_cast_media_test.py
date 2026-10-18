@@ -67,26 +67,38 @@ else: raise AssertionError(f'0.6 passed the cap guard: {dev.log[-3:]}')
 dev.cap_violations.clear();bridge.request_airplay_volume(-21)  # back to 0.3, inside the cap
 assert until(lambda:dev.level==.3,10),dev.level
 
-# Media faults. stop_stream hits the bridge's own cast; the others need a fresh cast_audio().
+# Media faults, all on the bridge's own cast and recovered by main()'s loop under Walter's policy:
+# recast at once when the Hub drops our stream; wait for new AirPlay audio when a person chose
+# something else, or after RECAST_ATTEMPTS failed recasts.
 T0=time.monotonic()
 def say(fault,text): print(f'[{time.monotonic()-T0:5.1f}s] FAULT {fault}: {text}',flush=True)
-dev.configure({'stop_stream':True})
-assert until(lambda:bridge.stats['cast']['state']=='IDLE',10),(bridge.stats['cast'],dev.log[-5:])
-assert until(lambda:bridge.stats['clients']==0,20),bridge.stats
-say('stop_stream',f"bridge saw {bridge.stats['cast']['state']}, clients={bridge.stats['clients']}")
-time.sleep(10);assert dev.player_state=='IDLE' and sum('LOAD' in l for l in dev.log)==1,dev.log
-say('stop_stream','10 s later the bridge has not reloaded: the Hub stays silent until bridge.py restarts')
 stream='http://127.0.0.1:18865/live.mp3'
+def loads(d=dev): return sum(' LOAD ' in l for l in d.log)
+def flowing(d=dev):
+    n=len(d.capture);time.sleep(1);return len(d.capture)>n
+def playing(n): return loads()==n and dev.player_state=='PLAYING' and flowing()
+dev.configure({'stop_stream':True});t=time.monotonic()
+assert until(lambda:bridge.stats['cast']['state']=='IDLE',10),(bridge.stats['cast'],dev.log[-5:])
+say('stop_stream',f"bridge saw {bridge.stats['cast']['state']}")
+assert until(lambda:playing(2),40),(bridge.stats['cast'],dev.log[-5:])
+say('stop_stream',f'recast after {time.monotonic()-t:.0f}s with no AirPlay audio; the fake pulls the stream again')
+# load_error: LOAD_FAILED on every recast. Two attempts stand in for the policy's five (~3 min here).
+# The startup cast and the recast above used two; 3 s of play then refills the budget on the next 5 s poll.
+bridge.RECAST_ATTEMPTS,bridge.STEADY_PLAY=2,3;time.sleep(8)
+dev.configure({'load_error':True,'stop_stream':True});t=time.monotonic()
+assert until(lambda:loads()==4,90),dev.log[-6:]
+# The second LOAD fails after load_stream()'s 20 s PLAYING poll; then the bridge gives up.
+time.sleep(30);assert loads()==4,dev.log[-6:]
+say('load_error',f'2 recasts failed, none since; {time.monotonic()-t:.0f}s in the bridge is running and waits for new AirPlay audio')
+dev.configure({'load_error':False});t=time.monotonic();play(tone(1000,1))
+assert until(lambda:playing(5),30),(bridge.stats['cast'],dev.log[-6:])
+say('load_error',f'new AirPlay audio: recast and playing {time.monotonic()-t:.0f}s after play')
+bridge.RECAST_ATTEMPTS=5
 fakes=[]
 def fresh(n,**faults):
     fakes.append(FakeCastDevice(uuid.UUID(f'f4a1c0de-0000-4000-8000-0000000000b{n}'),f'Fake Hub {n}',
                           'Google Nest Hub',18109+100*n,'127.0.0.1',18110+100*n,**faults))
     return fakes[-1]
-d=fresh(1,load_error=True);t=time.monotonic()
-try: bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
-except RuntimeError as exc: say('load_error',f'cast_audio raised after {time.monotonic()-t:.0f}s: {exc!r:.80}')
-else: raise AssertionError(f'cast_audio succeeded although LOAD failed: {d.log}')
-assert sum('LOAD' in l for l in d.log)==1 and not d.capture,d.log
 d=fresh(2,launch_delay=8);t=time.monotonic()
 cast,_=bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
 launches=sum('LAUNCH' in l for l in d.log)
@@ -94,13 +106,15 @@ launches=sum('LAUNCH' in l for l in d.log)
 assert launches==2 and d.state()['player_state']=='PLAYING' and d.capture,d.log
 say('launch_delay',f'cast_audio succeeded after {time.monotonic()-t:.0f}s with {launches} LAUNCHes sent; {d.log[-4:]}')
 # Another sender takes the Hub, or its app quits: pychromecast drops our media status to UNKNOWN
-# (never IDLE), which is what bridge.main() copies into stats['cast']['state'].
-for n,fault,app in ((3,'takeover','CC32E753'),(4,'close_app',None)):
-    d=fresh(n);cast,_=bridge.cast_audio('127.0.0.1',str(d.uuid),stream)
-    d.configure({fault:True});pulled=len(d.capture)
-    assert until(lambda:cast.status.app_id==app and cast.media_controller.status.player_state=='UNKNOWN',5),\
-        (cast.status,cast.media_controller.status,d.log[-4:])
-    time.sleep(10);assert len(d.capture)==pulled and sum('LOAD' in l for l in d.log)==1,d.log
-    say(fault,f'bridge saw app={app} state=UNKNOWN; 10 s later no reload and no bytes pulled: the Hub stays silent')
+# (never IDLE). A person chose this, so the bridge stays put until AirPlay plays again.
+for fault,app in (('takeover','CC32E753'),('close_app',None)):
+    n=loads();dev.configure({fault:True})
+    assert until(lambda:dev.app_id==app and bridge.stats['cast']['state']=='UNKNOWN',10),(bridge.stats['cast'],dev.log[-4:])
+    pulled=len(dev.capture);time.sleep(20)
+    assert loads()==n and dev.app_id==app and len(dev.capture)==pulled,dev.log[-4:]
+    say(fault,f'bridge saw app={app} state=UNKNOWN; 20 s later it has left the Hub alone')
+    t=time.monotonic();play(tone(1000,1))
+    assert until(lambda:playing(n+1),30),(bridge.stats['cast'],dev.log[-6:])
+    say(fault,f'new AirPlay audio: recast and playing {time.monotonic()-t:.0f}s after play')
 for d in (dev,*fakes): d.check_cap()
 print('PASS no SET_VOLUME above 0.5 reached any fake')
