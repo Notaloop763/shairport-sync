@@ -34,11 +34,13 @@ assert state['load']=={'contentId':'http://127.0.0.1:18865/live.mp3','contentTyp
 print('PASS the fake launched',state['app_id'],'and loaded',state['load'])
 assert until(lambda:len(dev.capture)>0,5) and bridge.stats['clients']==1
 print('PASS the fake pulls the bridge stream:',len(dev.capture),'bytes so far')
-# The fake reports currentTime 0, so lag_s is all the audio sent to it.
-assert until(lambda:bridge.stats['cast'].get('lag_s',0)>0,15),bridge.stats
+# The fake buffers nothing: PyChromecast advances its position in real time from the PLAYING
+# status, as fast as bytes arrive, so lag_s stays near 0 however long it has streamed.
+assert until(lambda:'lag_s' in bridge.stats['cast'],15),bridge.stats
+time.sleep(6)  # main() samples every 5 s; let a few seconds of audio flow first
 lag,held=bridge.stats['cast']['lag_s'],len(dev.capture)/bridge.MP3_BYTES_PER_S
-assert abs(lag-held)<6,(lag,held)  # main() samples every 5 s
-print(f'PASS lag_s {lag}s tracks the {held:.1f}s of MP3 the fake received')
+assert held>4 and abs(lag)<0.5,(lag,held)
+print(f'PASS lag_s {lag}s for a fake that holds nothing, after {held:.1f}s of MP3')
 
 import numpy as np
 from fake_cast_device import listen

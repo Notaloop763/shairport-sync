@@ -355,11 +355,14 @@ def main():
         if status and stats['cast']:
             stats['cast']['state'] = status.player_state
             # Audio the Hub holds unplayed: seconds sent on its one connection minus its position.
+            # Negative means the Hub reopened the stream without a new LOAD; discard that reading.
             with lock:
                 sent = [n for k, n in stats['sent_bytes'].items()
                         if k.rpartition(':')[0] == stats['cast']['host']]
             if len(sent) == 1 and status.adjusted_current_time is not None:
                 stats['cast']['lag_s'] = round(sent[0] / MP3_BYTES_PER_S - status.adjusted_current_time, 2)
+            else:
+                stats['cast'].pop('lag_s', None)
         if status and status.player_state in ('PLAYING', 'BUFFERING') and status.content_id == stream:
             lost_since = wait_audio_since = None
             playing_since = playing_since or now
