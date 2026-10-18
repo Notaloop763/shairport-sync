@@ -240,7 +240,8 @@ def run_software(args, out):
     asks = []
     def volume(db):
         asks.append((time.monotonic(), db)); bridge.request_airplay_volume(db)
-    hooks = {10: lambda: dev.configure(oneshot)} if oneshot else {}  # mid sustained run
+    # Marker 10 is written for 1.5 s and plays ~0.3 s late; 0.75 s after its first write the fault lands inside it.
+    hooks = {10: lambda: threading.Timer(.75, dev.configure, [oneshot]).start()} if oneshot else {}
     events = drive(fifo, scenario(), volume, hooks)
     time.sleep(PROFILES[args.profile]['buffer_s'] + 2)  # the tail is still in the receiver's queue
     with dev.lock:
