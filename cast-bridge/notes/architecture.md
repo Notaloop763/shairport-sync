@@ -32,12 +32,21 @@ repo at `upstream/development` 380e6b1b.
 | AirPlay event (code, source) | Cast action | Status |
 |---|---|---|
 | Pause, rate 0 (`paus`, `rtsp.c:1577`) | Cast PAUSE immediately | step 1 |
-| Play requested, rate 1 (`pres`, `rtsp.c:1562`) | nothing yet; wait for `prsm` | step 1 |
-| Audio actually resumed (`prsm`, `player.c:2707`) | PLAY; re-LOAD instead after a flush or a pause over 30 s | step 1 |
-| Flush (`pfls`, `player.c:5456`) | Cast PAUSE; mark the next resume as needing a re-LOAD | step 1 |
+| Resume, rate 1 (`pres`, `rtsp.c:1562`) | PLAY; re-LOAD instead after a flush or a pause over 30 s | step 1 |
+| Flush-all (**no event**, see below) | Cast PAUSE; mark the next resume as needing a re-LOAD | step 1, blocked |
 | Session begin/end (`pbeg`/`pend`, `player.c:5513`/`5558`) | LOAD / let the recovery loop own it | step 1 |
 | Volume (`pvol`, `player.c:5193`; today the curl hook) | SET_VOLUME through the existing worker, cap honoured | done (hook) |
 | Metadata block (`mdst`…`mden`, `rtsp.c:3367`; `PICT` artwork) | update Cast metadata without a re-LOAD | step 2 |
+
+**AirPlay 2 flushes are invisible on the pipe.** `pfls` comes only from `player_flush`
+(`player.c:5456`), which only classic `FLUSH` and `RECORD` call (`rtsp.c:2395`, `1019`). AP2
+`FLUSHBUFFERED` (`rtsp.c:1430-1450`) sets flags and stops playback with no metadata. `prsm`
+is deprecated and AP2 buffered audio uses `paus`/`pres` (`metadata/core.c:88-94`). Without a
+flush event, step 1 must either re-LOAD on every resume (costs startup lag each time) or PLAY
+on every resume (after a skip the Hub plays out the old track's buffered tail). The clean fix
+is a `receiver/ap2-flush-metadata` topic that sends `pfls` from the AP2 flush-all path:
+small, matches the documented meaning of `pfls`, and fit for upstream. Walter decides
+which; `pdis` (timestamp discontinuity) might also mark a skip, untested.
 
 | Cast event (Hub touch, voice, Home app) | AirPlay command (MQTT `<topic>/remote`) | Status |
 |---|---|---|
@@ -82,9 +91,13 @@ Startup latency is a delivery problem, separate from the table. Two ways to deli
 
 - **HTTP pull** (today): the Default Media Receiver fetches `/live.mp3`. It has a media
   session, so pause, now-playing and Hub buttons work. Latency ≈ 2 s AirPlay floor + Hub
-  buffer. PlayOnAir's mitigation: hold 8 s ahead and burst it on GET
-  (`play-on-air/.../media/http.rs:61`); our burst attempt
-  did not help on the real Hub.
+  buffer. PlayOnAir's mitigation (`play-on-air/.../media/http.rs:28-61`): its receiver
+  releases audio 8 s *before* its presentation time and bursts it on GET, so the Cast buffer
+  fills with future audio and pause is left to Cast PAUSE. Our prototype-9 change only
+  removed FFmpeg's 5 s input hold; it didn't release audio early, so it doesn't test this.
+  Shairport's analog is a negative `audio_backend_latency_offset_in_seconds`; how far the
+  pipe backend allows it is unverified. PlayOnAir measured, on Nest Audio and Mini, that
+  Cast starts once ~2-4 s of audio is buffered; our Hub holds 3.4-5.6 s (`lag_s`), which fits.
 - **Cast Streaming** (RTP push): audio-only app `85CDB22F`, sender-chosen `targetDelay`
   (example 400 ms), receivers buffer ≤ 1200 ms by default
   (`openscreen/cast/protocol/streaming_session_protocol.md:158,429,506`). OwnTone uses it
@@ -111,6 +124,24 @@ when he says.
   (`pychromecast/controllers/media.py`) first, then `rust-cast` and `node-castv2-client`.
   `openscreen/cast/common/channel/proto/cast_channel.proto` is authoritative for framing,
   chunking and auth.
+
+## PlayOnAir's spec, checked (2026-10-18)
+
+`play-on-air/docs/ap2-receiver-spec.md` comes from Ghidra on Apple's frameworks plus live
+receivers. Checked against Shairport (independently reverse-engineered, hardware-tested):
+
+| Claim (spec section) | Independent check | Verdict |
+|---|---|---|
+| Rate 0 keeps buffered audio (§1) | Shairport clears the anchor and stops, no flush (`rtsp.c:1565-1577`) | agrees |
+| Flush-all stops playback; range flush keeps playing (§2) | Same split on `flushFromSeq` (`rtsp.c:1430-1470`) | agrees |
+| `POST /command` `sendMediaRemoteCommand` shape (§5) | Same keys (`remote/remote.c:216-218`) | agrees |
+| `dvlc` volume report: `volume` top level and in `params` (§5) | Identical (`remote/remote.c:342-347`) | agrees |
+| MediaRemote numbers (§5, listed as open) | play 0 … next 4, prev 5 (`remote/remote.h:13-25`), live-tested on iPhone (upstream #2256) | Shairport fills the gap |
+| Slider linear in dB, `-30..0`, `-144` mute (§6) | Shairport's own docs (`metadata/core.c` `pvol`); our iPhone readings fit | agrees |
+| Receiver pauses locally before forwarding a pause (§1, §5) | PlayOnAir tests it (`bridge/remote.rs:182`); not checkable here | plausible |
+| "What the fork does" notes | Volume note is stale: PlayOnAir now uses `(dB + 30) / 30` (`airplay/mod.rs:955`) | stale |
+
+PTP, advertising and multizone sections weren't checked; we don't depend on them.
 
 ## Open questions
 
