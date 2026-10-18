@@ -23,16 +23,17 @@ merges them all:
 The main checkout stays on `bridge`. Work on each topic in its own worktree:
 `git worktree add .worktrees/<topic> -b <branch> <base>`.
 
-An upstream PR is opened only when Walter explicitly says to open that one; the default is no.
-Once he has, or when answering review on an upstream PR, follow `UPSTREAMING.md`.
+A pull request, against `upstream` or `origin`, is opened only when Walter explicitly asks for
+that one. Once he has, or when answering review on an upstream PR, follow `UPSTREAMING.md`.
 
 ## Roles
 
-Claude owns code changes: commit on topic branches, merge them into `bridge`, and push to
-`origin` when Walter says so. Hermes (an agent on the NAS with read-only GitHub access) builds
-the images and deploys them in Komodo from what's pushed. To change the live stack, write
-Hermes a deploy request for Walter to relay: the commit to build, the image tag, the compose
-changes, and the check to run afterwards.
+Claude owns code changes: commit on topic branches, merge them into `bridge`, and push
+branches, `bridge` included, to `origin` as the work goes. `origin` is the only remote Claude
+pushes to. Hermes (an agent on the NAS with read-only GitHub access) builds the images and
+deploys them in Komodo from what's pushed. To change the live stack, write Hermes a deploy
+request for Walter to relay: the commit to build, the image tag, the compose changes, and the
+check to run afterwards.
 
 ## Safety
 
