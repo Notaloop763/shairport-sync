@@ -80,3 +80,16 @@ settings, or measure position against PCM sent.
 behaviour are guesses (`fake-cast-faults.md` "Fidelity to the real Hub"), and the burst
 experiment showed the real Hub behaves differently. Every latency or pause claim needs a
 real-Hub check with Walter listening.
+
+## Minor
+
+**13. The last ~70 ms before a pause plays 0.5 s late.** libmp3lame holds about 70 ms of
+audio after input stops (3 s of tone in, 70,316 of 72,000 MP3 bytes out, and nothing more
+for a second). The bridge's keepalive silence releases it once input has been idle for 0.5
+s (`feed_pcm`). A listener would hear the music stop, then a faint blip of its final
+fraction of a second half a second later. No audio is lost; continuous playback and track
+changes are unaffected; it does not cause the pause lag in item 1. Walter's call: record
+it, don't fix it now. Evidence: `audio_acceptance.py --profile reference` (2026-10-18)
+shows it as a 0.5 s gap in each tone; it did not check how it sounds on the real Hub. Fix,
+if it is ever worth it: write a short burst of silence as soon as input stops, instead of
+waiting 0.5 s, and check that the shorter wait doesn't insert silence into input jitter.
