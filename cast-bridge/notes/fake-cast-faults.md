@@ -27,18 +27,25 @@ failures while the socket is not connected do not count as attempts for up to
 
 ## Media faults
 
-`tests/fake_cast_media_test.py` runs `bridge.main()` against the fake, 2026-10-18, on
-`fork/fake-cast-media`.
+`tests/fake_cast_media_test.py` runs `bridge.main()` against the fake. The gaps were found
+2026-10-18 on `fork/fake-cast-media`; `fork/bridge-recovery` closes them under Walter's recovery
+policy: when the Hub drops our stream, recast at once; when a person chose something else
+(another app, no app, idleReason CANCELLED or INTERRUPTED, another LOAD), wait for new AirPlay
+audio (input resuming after a stall, with sound in it). Each loss gets 5 attempts, spaced 5, 10,
+20 and 40 s apart, then the bridge waits for new AirPlay audio. 60 s of steady play refills the
+budget. `main()` declares a loss after 10 s without PLAYING or BUFFERING of our stream.
 
-| Fault | What the bridge did | Verdict |
-|-------|---------------------|---------|
-| Stream stops mid-play (`stop_stream`) | `/status` showed `IDLE` and 0 clients within 2 s. Nothing reloaded; 10 s later the Hub was still idle. | **Gap**: silent until bridge.py restarts |
-| LOAD answered with LOAD_FAILED (`load_error`) | `cast_audio()` raised after 22 s (its 20 s PLAYING poll). In `main()` that ends the process. | Fails loudly; recovery depends on the container restart policy |
-| LAUNCH 8 s late (`launch_delay`) | `play_media()` 2 s after `launch()` found no app and sent a second LAUNCH; LOAD followed it. Casting started after 11 s. | Handled |
-| Another sender takes the Hub (`takeover`) | pychromecast saw Spotify's app and reset our media status to `UNKNOWN`, not `IDLE`. No reload; 10 s later no bytes pulled. | **Gap**: silent until bridge.py restarts, and `/status` says `UNKNOWN` |
-| The app quits (`close_app`) | pychromecast saw no app and `UNKNOWN`. No reload; 10 s later no bytes pulled. | **Gap**: same as takeover |
+| Fault | Before | After (`fork/bridge-recovery`) | Verdict |
+|-------|--------|--------------------------------|---------|
+| Stream stops mid-play (`stop_stream`) | `IDLE` within 2 s, no reload: silent until restart | Recast 14 s after the stop, no AirPlay audio needed | Recovers |
+| LOAD answered with LOAD_FAILED (`load_error`) | `cast_audio()` raised after 22 s and `main()` exited | Each failed recast is logged (`RECAST_FAILURE`) and retried; after the last, `RECAST_GAVE_UP` and no more LOADs. New AirPlay audio recast it 8 s after play. Tested with 2 attempts, not 5 | Recovers |
+| LAUNCH 8 s late (`launch_delay`) | A second LAUNCH from `play_media()`; casting after 11 s | Unchanged | Handled |
+| Another sender takes the Hub (`takeover`) | `UNKNOWN`, no reload: silent until restart | `CAST_LOST ... waiting_for_audio: true`; leaves Spotify alone for 20 s, recasts 8 s after AirPlay plays | Stays put, then recovers on AirPlay |
+| The app quits (`close_app`) | Same as takeover | Same as takeover, with no app | Stays put, then recovers on AirPlay |
 
-A check on `cast.state == 'PLAYING'` catches all three gaps; one on `IDLE` would miss the last two.
+pychromecast reports `UNKNOWN`, not `IDLE`, for takeover and close_app, so `main()` watches for
+PLAYING going away. A recast that fails while AirPlay is already playing waits for the next
+pause and play: audio only counts if it resumed after the bridge gave up.
 
 ## Fidelity to the real Hub
 
