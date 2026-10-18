@@ -70,4 +70,20 @@ assert until(lambda:loads()>n,10) and dev.player_state=='PAUSED',dev.log
 dev.configure({'load_error':False})
 assert until(lambda:dev.player_state=='PLAYING',90),(bridge.stats['cast'],dev.log[-6:])
 print('PASS a refused re-LOAD was recovered by the main loop')
+
+# Another app owns the Hub (pychromecast may attach its media controller to that app's session):
+# an AirPlay pause or resume must not touch their media, but one for our own stream still does.
+import types
+class Controller:
+    def __init__(self,content_id): self.status=types.SimpleNamespace(content_id=content_id,idle_reason=None);self.calls=[]
+    def pause(self): self.calls.append('pause')
+    def play(self): self.calls.append('play')
+real=bridge.cast_target;stream='http://127.0.0.1:18965/live.mp3'
+for app,content,expected in (('CC32E753','spotify:track',[]),('CC1AD845',stream,['pause'])):
+    bridge.paused_by_us=False;bridge.cast_target=types.SimpleNamespace(app_id=app,media_controller=Controller(content))
+    bridge.handle('paus',stream);assert bridge.cast_target.media_controller.calls==expected,(app,expected)
+    bridge.handle('pres',stream)
+    assert bridge.cast_target.media_controller.calls==expected+(['play'] if expected else []),app
+bridge.cast_target=real;bridge.paused_by_us=False
+print('PASS an AirPlay pause or resume left another app\'s media alone')
 dev.check_cap()

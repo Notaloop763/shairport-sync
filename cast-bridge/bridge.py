@@ -205,10 +205,13 @@ def handle(code, stream):
         return
     print('AIRPLAY_EVENT', code, flush=True)
     try:
+        # Another app or sender owns the Hub: PAUSE or PLAY would hit their media. The recovery
+        # loop recasts on new AirPlay audio, as Walter's policy says.
+        if chosen_elsewhere(cast_target, cast_target.media_controller.status, stream):
+            return
         if code == 'pres':
             paused_by_us = False
             if needs_reload:
-                needs_reload = False
                 with cast_lock:
                     load_stream(cast_target, stream)
             else:
@@ -337,8 +340,8 @@ class DropWatch:
 
 
 def load_stream(cast, stream):
-    global paused_by_us
-    paused_by_us = False  # a LOAD starts playback, so any pause of ours is over
+    global paused_by_us, needs_reload
+    paused_by_us = needs_reload = False  # a LOAD starts fresh playback: no pause or stale buffer left
     # Preserve the user's current device volume across bridge restarts.
     cast.media_controller.launch()
     time.sleep(2)
