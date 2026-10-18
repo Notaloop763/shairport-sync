@@ -4,7 +4,7 @@ Needs pychromecast (for its generated CastMessage proto) and zeroconf. Touches o
 sockets of its own, never the real Hub.
 
 What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages that produces.
-"fake" says whether this module answers it; the rest is out of scope for the volume path.
+"fake" says whether this module answers it.
 
   discover()      get_chromecasts(timeout=15), stop_discovery   mDNS browse only          fake: advertised
   cast_audio()    Zeroconf(unicast=True)                        mDNS                       fake: advertised
@@ -13,8 +13,13 @@ What bridge.py asks of a Cast device (pychromecast 14.0.10) and the messages tha
                                                                 tp.connection CONNECT,
                                                                 receiver GET_STATUS,
                                                                 heartbeat PING every 10 s  fake: answered
-                  media_controller.launch() / play_media()      receiver LAUNCH, media LOAD fake: NOT answered
-                  media_controller.status                       media GET_STATUS           fake: NOT answered
+                  media_controller.launch()                     receiver LAUNCH            fake: answered
+                                                                tp.connection CONNECT to
+                                                                the app's transportId      fake: no reply, as real
+                  media_controller.play_media()                 media LOAD                 fake: answered
+                                                                HTTP GET of the LOAD URL,
+                                                                as the Hub pulls the stream fake: pulled
+                  media_controller.status                       media GET_STATUS           fake: answered
                   cast_info.friendly_name / host / model_name   mDNS TXT                   fake: advertised
   apply_volume()  cast.status.volume_level / volume_muted       cached RECEIVER_STATUS     fake: answered
                   cast.set_volume(level)                        receiver SET_VOLUME {volume:{level}}
@@ -32,14 +37,29 @@ Faults, settable at startup (flags) or at runtime: POST JSON to http://127.0.0.1
   {"delay": 3.0}                 delay every reply by N seconds
   {"ignore_set_volume": true}    accept SET_VOLUME, change nothing, send no reply
   {"clamp_max": 0.4, "round_step": 0.05}   the device's own cap / quantisation of SET_VOLUME levels
+  {"volume_cap": 0.5}            CAST_VOLUME_CAP guard (default 0.5): a SET_VOLUME above it is
+                                 applied but recorded in cap_violations; check_cap() then raises
   {"set_level": 0.7, "set_muted": true}    a physical button: change state, push status to senders
+  {"load_error": true}           answer every LOAD with LOAD_FAILED
+  {"stop_stream": true}          stop pulling the stream now and report IDLE (idleReason ERROR)
+  {"launch_delay": 8.0}          start the app, and answer LAUNCH, N seconds late
   {"withdraw": true}             drop the mDNS advertisement
   {"advertise": {"host": "127.0.0.2", "port": 8019}}   (re-)advertise, optionally elsewhere; the
                                  old listener closes and a new one opens on the new port
-GET / returns the current state as JSON.
+GET / (any path, e.g. /state) returns the current state as JSON, including the launched App ID
+and the LOAD's URL and content type.
+
+On LOAD the fake GETs the URL and keeps every byte in `capture`; playerState goes BUFFERING, then
+PLAYING on the first bytes, then IDLE (idleReason ERROR) if the stream ends. It refuses to fetch
+anything but loopback, so its runs stay off the LAN. listen(capture) decodes and measures it (needs
+ffmpeg and numpy), so a test can tell whether the right audio arrived.
+
+MEDIA_STATUS and the app entry in RECEIVER_STATUS follow Google's Cast message docs; they are not
+yet read back from the real Hub.
 """
 import argparse
 import json
+import re
 import socket
 import ssl
 import struct
@@ -47,6 +67,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -56,6 +78,8 @@ from zeroconf import ServiceInfo, Zeroconf
 NS_CONNECTION = 'urn:x-cast:com.google.cast.tp.connection'
 NS_HEARTBEAT = 'urn:x-cast:com.google.cast.tp.heartbeat'
 NS_RECEIVER = 'urn:x-cast:com.google.cast.receiver'
+NS_MEDIA = 'urn:x-cast:com.google.cast.media'
+APPS = {'CC1AD845': 'Default Media Receiver'}
 
 
 def f32(x):
@@ -67,6 +91,26 @@ USER_EQ = {'high_shelf': {'frequency': 4500, 'gain_db': 6.0, 'quality': 0.707},
            'max_peaking_eqs': 0, 'peaking_eqs': []}
 
 
+def listen(mp3):
+    """Decode MP3 bytes; return sample rate, seconds louder than -40 dBFS, loudest 20 ms window's
+    level, and the FFT peak of the loud stretch."""
+    import numpy as np
+    out = subprocess.run(['ffmpeg', '-hide_banner', '-f', 'mp3', '-i', 'pipe:0', '-ac', '1',
+                          '-f', 's16le', 'pipe:1'], input=bytes(mp3), capture_output=True, check=True)
+    rate = int(re.search(rb'Audio: mp3.*?, (\d+) Hz', out.stderr).group(1))
+    x = np.frombuffer(out.stdout, '<i2') / 32768
+    win = rate // 50
+    n = len(x) // win
+    rms = np.sqrt((x[:n * win].reshape(n, win) ** 2).mean(1)) if n else np.zeros(1)
+    loud = np.flatnonzero(rms > 10 ** (-40 / 20))
+    peak = None
+    if len(loud):
+        seg = x[loud[0] * win:(loud[-1] + 1) * win]
+        peak = float(np.abs(np.fft.rfft(seg * np.hanning(len(seg)))).argmax() * rate / len(seg))
+    return {'rate': rate, 'seconds': len(loud) / 50, 'peak_hz': peak,
+            'max_dbfs': float(20 * np.log10(max(rms.max(), 1e-10)))}
+
+
 class FakeCastDevice:
     def __init__(self, uuid, name, model, port, host, control_port=8010, **faults):
         self.uuid, self.name, self.model = uuid, name, model
@@ -75,6 +119,12 @@ class FakeCastDevice:
         self.level, self.muted = 1.0, False
         self.no_pong, self.delay, self.ignore_set_volume = False, 0.0, False
         self.clamp_max, self.round_step = None, None
+        self.load_error, self.launch_delay = False, 0.0
+        self.volume_cap, self.cap_violations = 0.5, []  # the Hub is in Walter's bedroom
+        self.app_id, self.session_id = None, None
+        self.load, self.player_state, self.idle_reason = None, None, None  # load: the LOAD's media
+        # shortcut: capture grows ~24 kB/s at 192 kbit/s without bound; cap it if runs get long.
+        self.capture, self.pull_stop = bytearray(), threading.Event()
         self.conns = {}  # socket -> send lock
         self.zc, self.info, self.listener = Zeroconf(), None, None
         self.log = []
@@ -112,11 +162,17 @@ class FakeCastDevice:
             return {'level': self.level, 'muted': self.muted, 'no_pong': self.no_pong,
                     'delay': self.delay, 'ignore_set_volume': self.ignore_set_volume,
                     'clamp_max': self.clamp_max, 'round_step': self.round_step,
-                    'advertised': self.info is not None, 'host': self.host, 'port': self.port,
+                    'volume_cap': self.volume_cap, 'cap_violations': self.cap_violations,
+                    'load_error': self.load_error, 'launch_delay': self.launch_delay,
+                    'app_id': self.app_id, 'player_state': self.player_state,
+                    'load': self.load and {k: self.load.get(k) for k in
+                                           ('contentId', 'contentType', 'streamType')},
+                    'capture_bytes': len(self.capture), 'advertised': self.info is not None, 'host': self.host, 'port': self.port,
                     'connections': len(self.conns), 'log': self.log[-20:]}
 
     def configure(self, cmd):
-        for key in ('no_pong', 'delay', 'ignore_set_volume', 'clamp_max', 'round_step'):
+        for key in ('no_pong', 'delay', 'ignore_set_volume', 'clamp_max', 'round_step',
+                    'load_error', 'launch_delay', 'volume_cap'):
             if key in cmd:
                 setattr(self, key, cmd[key])
         if 'set_level' in cmd or 'set_muted' in cmd:
@@ -124,6 +180,9 @@ class FakeCastDevice:
                 self.level = float(cmd.get('set_level', self.level))
                 self.muted = bool(cmd.get('set_muted', self.muted))
             self.broadcast()
+        if cmd.get('stop_stream'):
+            self.pull_stop.set()
+            self.stream_ended('stream stopped by control')
         if cmd.get('withdraw'):
             self.withdraw()
         if 'advertise' in cmd:
@@ -141,6 +200,10 @@ class FakeCastDevice:
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
             conn.close()
         self.note('dropped connections')
+
+    def check_cap(self):
+        """Fail the run if anything asked this device for more than volume_cap."""
+        assert not self.cap_violations, f'SET_VOLUME above cap {self.volume_cap}: {self.cap_violations}'
 
     def note(self, text):
         self.log.append(f'{time.strftime("%H:%M:%S")} {text}')
@@ -223,8 +286,8 @@ class FakeCastDevice:
                 pass
         threading.Timer(delay, go).start() if delay else go()
 
-    def reply(self, conn, req, namespace, payload):
-        msg = CastMessage(protocol_version=0, source_id='receiver-0', destination_id=req.source_id,
+    def reply(self, conn, req, namespace, payload, source='receiver-0'):
+        msg = CastMessage(protocol_version=0, source_id=source, destination_id=req.source_id,
                           namespace=namespace, payload_type=CastMessage.STRING,
                           payload_utf8=json.dumps(payload))
         self.send(conn, msg)
@@ -234,15 +297,72 @@ class FakeCastDevice:
             # Shape read from a real Nest Hub by cast_readback.py (2026-10-17) while it was casting:
             # no isActiveInput/isStandBy, floats are float32, controlType is 'master'. Its
             # `applications` held the Default Media Receiver; an idle Hub's list is unverified.
+            apps = [{'appId': self.app_id, 'displayName': APPS[self.app_id], 'isIdleScreen': False,
+                     'namespaces': [{'name': NS_MEDIA}], 'sessionId': self.session_id,
+                     'statusText': APPS[self.app_id], 'transportId': self.session_id}
+                    ] if self.app_id else []
             return {'requestId': request_id, 'type': 'RECEIVER_STATUS', 'status': {
-                'applications': [], 'version': 2, 'userEq': USER_EQ,
+                'applications': apps, 'version': 2, 'userEq': USER_EQ,
                 'volume': {'controlType': 'master', 'level': f32(self.level),
                            'muted': self.muted, 'stepInterval': f32(0.02)}}}
+
+    def media_status(self, request_id):
+        with self.lock:
+            status = [{'mediaSessionId': 1, 'playbackRate': 1, 'playerState': self.player_state,
+                       'currentTime': 0, 'supportedMediaCommands': 0,
+                       'volume': {'level': 1, 'muted': False}, 'media': self.load}
+                      ] if self.load else []
+            if status and self.idle_reason:
+                status[0]['idleReason'] = self.idle_reason
+            return {'requestId': request_id, 'type': 'MEDIA_STATUS', 'status': status}
 
     def broadcast(self):
         """Unsolicited status to every sender, as a Hub sends after a button press."""
         for conn in list(self.conns):
             self.reply(conn, CastMessage(source_id='sender-0'), NS_RECEIVER, self.status(0))
+
+    def broadcast_media(self):
+        for conn in list(self.conns):
+            self.reply(conn, CastMessage(source_id='*'), NS_MEDIA, self.media_status(0),
+                       self.session_id)
+
+    # --- media stream -----------------------------------------------------------------------
+    def pull(self, url, stop):
+        """GET the LOAD URL as the Hub does and keep the bytes until stopped or the stream ends."""
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                while not stop.is_set():
+                    chunk = resp.read1(4096)
+                    if not chunk:
+                        break
+                    with self.lock:
+                        if stop.is_set():
+                            break  # checked under the lock so a stop's IDLE is not overwritten
+                        self.capture += chunk
+                        first = self.player_state != 'PLAYING'
+                        self.player_state = 'PLAYING'
+                    if first:
+                        self.note(f'stream playing from {url}')
+                        self.broadcast_media()
+        except OSError as exc:
+            self.note(f'stream error {exc!r}')
+        if not stop.is_set():  # else a newer LOAD, LAUNCH or stop_stream took over
+            self.stream_ended('stream ended')
+
+    def stream_ended(self, why):
+        with self.lock:
+            self.player_state, self.idle_reason = 'IDLE', 'ERROR'
+        self.note(why)
+        self.broadcast_media()
+
+    def launched(self, conn, msg, app_id, rid):
+        with self.lock:
+            # Relaunching the running app keeps its session (unverified on the real Hub).
+            if self.app_id != app_id:
+                self.app_id, self.session_id = app_id, str(uuidlib.uuid4())
+                self.load = self.player_state = self.idle_reason = None
+                self.pull_stop.set()
+        self.reply(conn, msg, NS_RECEIVER, self.status(rid))
 
     def handle(self, conn, msg):
         data = json.loads(msg.payload_utf8)
@@ -260,6 +380,9 @@ class FakeCastDevice:
             with self.lock:
                 if 'level' in vol:
                     level = float(vol['level'])
+                    if self.volume_cap is not None and level > self.volume_cap:
+                        self.cap_violations.append(level)
+                        self.note(f'CAP VIOLATION {level} > {self.volume_cap}')
                     if self.round_step:
                         level = round(level / self.round_step) * self.round_step
                     if self.clamp_max is not None:
@@ -268,6 +391,31 @@ class FakeCastDevice:
                 if 'muted' in vol:
                     self.muted = bool(vol['muted'])
             self.reply(conn, msg, NS_RECEIVER, self.status(rid))
+        elif msg.namespace == NS_RECEIVER and kind == 'LAUNCH':
+            self.note(f'LAUNCH {data.get("appId")}')
+            if data.get('appId') not in APPS:
+                self.reply(conn, msg, NS_RECEIVER, {'requestId': rid, 'type': 'LAUNCH_ERROR',
+                                                    'reason': 'NOT_FOUND'})
+                return
+            args = (conn, msg, data['appId'], rid)
+            threading.Timer(self.launch_delay, self.launched, args).start() \
+                if self.launch_delay else self.launched(*args)
+        elif msg.namespace == NS_MEDIA and kind == 'GET_STATUS':
+            self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
+        elif msg.namespace == NS_MEDIA and kind == 'LOAD':
+            media = data.get('media', {})
+            url = media.get('contentId', '')
+            self.note(f'LOAD {url} {media.get("contentType")}')
+            if self.load_error or not (urllib.parse.urlsplit(url).hostname or '').startswith('127.'):
+                self.reply(conn, msg, NS_MEDIA, {'requestId': rid, 'type': 'LOAD_FAILED'},
+                           self.session_id)
+                return
+            with self.lock:
+                self.load, self.player_state, self.idle_reason = media, 'BUFFERING', None
+                self.pull_stop.set()
+                self.pull_stop = threading.Event()
+            threading.Thread(target=self.pull, args=(url, self.pull_stop), daemon=True).start()
+            self.reply(conn, msg, NS_MEDIA, self.media_status(rid), self.session_id)
         # tp.connection CONNECT/CLOSE get no reply on a real device; anything else is ignored.
 
 
@@ -284,10 +432,15 @@ def main():
     p.add_argument('--ignore-set-volume', action='store_true', default=None)
     p.add_argument('--clamp-max', type=float)
     p.add_argument('--round-step', type=float)
+    p.add_argument('--load-error', action='store_true', default=None)
+    p.add_argument('--launch-delay', type=float)
+    p.add_argument('--volume-cap', type=float)
     a = p.parse_args()
     dev = FakeCastDevice(uuidlib.UUID(a.uuid), a.name, a.model, a.port, a.host, a.control_port,
                          no_pong=a.no_pong, delay=a.delay, ignore_set_volume=a.ignore_set_volume,
-                         clamp_max=a.clamp_max, round_step=a.round_step)
+                         clamp_max=a.clamp_max, round_step=a.round_step,
+                         load_error=a.load_error, launch_delay=a.launch_delay,
+                         volume_cap=a.volume_cap)
     print(f'fake cast {a.uuid} "{a.name}" on {a.host}:{a.port}, control http://127.0.0.1:{a.control_port}/',
           flush=True)
     threading.Event().wait()
