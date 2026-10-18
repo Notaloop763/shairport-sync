@@ -42,6 +42,7 @@ budget. `main()` declares a loss after 10 s without PLAYING or BUFFERING of our 
 | LAUNCH 8 s late (`launch_delay`) | A second LAUNCH from `play_media()`; casting after 11 s | Unchanged | Handled |
 | Another sender takes the Hub (`takeover`) | `UNKNOWN`, no reload: silent until restart | `CAST_LOST ... waiting_for_audio: true`; leaves Spotify alone for 20 s, recasts 8 s after AirPlay plays | Stays put, then recovers on AirPlay |
 | The app quits (`close_app`) | Same as takeover | Same as takeover, with no app | Stays put, then recovers on AirPlay |
+| Hub missing at startup (`withdraw`, then `advertise`) | Discovery failed and `main()` exited | `RECAST_FAILURE` "not discovered"; cast 3 s after the Hub advertised | Recovers |
 
 pychromecast reports `UNKNOWN`, not `IDLE`, for takeover and close_app, so `main()` watches for
 PLAYING going away. A recast that fails while AirPlay is already playing waits for the next
