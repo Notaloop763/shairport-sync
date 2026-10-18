@@ -135,6 +135,8 @@ def feed_pcm(proc, path):
         if ready:
             chunk = os.read(fd, BLOCK * 8)
             if chunk:
+                if idle:
+                    stats['input_resumed_monotonic'] = time.monotonic()
                 pending.extend(chunk)
                 stats['pcm_bytes'] += len(chunk)
                 last_input = time.monotonic()
@@ -247,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
 
-def cast_audio(host, uuid, stream):
+def connect(uuid):
     import uuid as uuidlib
     import pychromecast
     import zeroconf
@@ -255,9 +257,22 @@ def cast_audio(host, uuid, stream):
     casts, browser = pychromecast.get_listed_chromecasts(
         uuids=[uuidlib.UUID(uuid)], discovery_timeout=20, zeroconf_instance=zconf)
     if not casts:
+        pychromecast.discovery.stop_discovery(browser)
+        zconf.close()
         raise RuntimeError('Target Cast UUID not discovered')
     cast = casts[0]
     cast.wait(timeout=20)
+    return cast, browser
+
+
+def cast_audio(host, uuid, stream):
+    cast, browser = connect(uuid)
+    load_stream(cast, stream)
+    # Keep the Cast connection and discovery browser alive for this process.
+    return cast, browser
+
+
+def load_stream(cast, stream):
     # Preserve the user's current device volume across bridge restarts.
     cast.media_controller.launch()
     time.sleep(2)
@@ -269,11 +284,27 @@ def cast_audio(host, uuid, stream):
         time.sleep(0.5)
     else:
         raise RuntimeError(f'Cast failed to load bridge stream: {cast.media_controller.status}')
-    stats['cast'] = {'uuid': uuid, 'name': cast.cast_info.friendly_name,
+    stats['cast'] = {'uuid': str(cast.uuid), 'name': cast.cast_info.friendly_name,
                      'host': cast.cast_info.host, 'state': cast.media_controller.status.player_state}
     print('CAST_STARTED', json.dumps(stats['cast']), flush=True)
-    # Keep the Cast connection and discovery browser alive for this process.
-    return cast, browser
+
+
+RECAST_ATTEMPTS = 5
+RECAST_DELAYS = (5, 10, 20, 40)  # seconds after each failed attempt; Walter's policy
+LOST_AFTER = 10.0  # BUFFERING blips are normal; only a longer absence of PLAYING is a loss
+STEADY_PLAY = 60.0  # this long playing again restores the attempt budget
+
+
+def chosen_elsewhere(cast, status, stream):
+    """True when a person most likely stopped us: another app, no app, a stop, or another LOAD."""
+    return (cast.app_id != 'CC1AD845' or status.idle_reason in ('CANCELLED', 'INTERRUPTED')
+            or status.content_id not in (None, stream))
+
+
+def new_airplay_audio(since):
+    """AirPlay input resumed after `since` and carried sound: someone pressed play."""
+    return (stats.get('input_resumed_monotonic', 0) > since
+            and stats.get('last_audio_monotonic', 0) > since)
 
 
 def main():
@@ -303,12 +334,52 @@ def main():
     server = ThreadingHTTPServer((host, port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     time.sleep(2)
-    target, browser = cast_audio(host, os.environ['CAST_UUID'], f'http://{host}:{port}/live.mp3')
-    cast_target = target
+    stream = f'http://{host}:{port}/live.mp3'
+    # Walter's recovery policy: recast at once when the Hub drops our stream; when a person chose
+    # something else, wait for new AirPlay audio. RECAST_ATTEMPTS tries, then wait for new audio.
+    target = browser = None
+    lost_since, confirmed, wait_audio_since = time.monotonic(), True, None  # nothing cast yet
+    attempts, next_try, playing_since = 0, 0.0, None
     while True:
         if proc.poll() is not None:
             raise RuntimeError('Encoder died')
-        stats['cast']['state'] = target.media_controller.status.player_state
+        now = time.monotonic()
+        status = target.media_controller.status if target else None
+        if status and stats['cast']:
+            stats['cast']['state'] = status.player_state
+        if status and status.player_state in ('PLAYING', 'BUFFERING') and status.content_id == stream:
+            lost_since = wait_audio_since = None
+            playing_since = playing_since or now
+            if now - playing_since >= STEADY_PLAY:
+                attempts = 0
+        else:
+            playing_since = None
+            if lost_since is None:
+                lost_since, confirmed = now, False
+            if not confirmed and now - lost_since >= LOST_AFTER:
+                confirmed = True
+                if chosen_elsewhere(target, status, stream):
+                    wait_audio_since = lost_since
+                print('CAST_LOST', json.dumps({'state': status.player_state, 'idle_reason': status.idle_reason,
+                      'app_id': target.app_id, 'waiting_for_audio': wait_audio_since is not None}), flush=True)
+            if confirmed and wait_audio_since is None and attempts >= RECAST_ATTEMPTS:
+                wait_audio_since = now
+                print('RECAST_GAVE_UP', json.dumps({'attempts': attempts}), flush=True)
+            if wait_audio_since is not None and new_airplay_audio(wait_audio_since):
+                wait_audio_since, attempts, next_try = None, 0, now
+            if confirmed and wait_audio_since is None and now >= next_try:
+                attempts += 1
+                try:
+                    if target is None:
+                        target, browser = connect(os.environ['CAST_UUID'])
+                        cast_target = target
+                    load_stream(target, stream)
+                except Exception as exc:
+                    print('RECAST_FAILURE', json.dumps({'attempt': attempts, 'error': repr(exc)}), flush=True)
+                    next_try = time.monotonic() + RECAST_DELAYS[min(attempts, len(RECAST_DELAYS)) - 1]
+                else:
+                    lost_since = None
+                continue
         time.sleep(5)
 
 
