@@ -14,6 +14,12 @@ or a shortcut and doesn't fix it in the same change.
 pipe and the volume hook. On pause it sends keepalive silence and the Hub plays out what it
 has buffered: pause lags ~`lag_s` + 0.8 s (4-5.5 s measured on the real Hub). Fix:
 `architecture.md` step 1.
+- Built 2026-10-18 on `fork/airplay-events` (bridge `prototype-10`): `paus`, `pfls` and `pres`
+  drive Cast PAUSE, PLAY and re-LOAD, tested on the fake Hub (`tests/airplay_events_test.py`).
+  Not yet checked on the real Hub, so the item stays: delete it once Walter hears the pause
+  land in under a second.
+- Cost to expect: an iPhone pause is always followed by a flush, so every resume is a LOAD and
+  pays the startup lag of item 3, where it used to continue in under a second.
 
 **2. AirPlay 2 flushes emit no metadata event.** Shairport sends `pfls` only for classic
 FLUSH; AP2 `FLUSHBUFFERED` stops playback silently (`rtsp.c:1430-1450`). Without it the

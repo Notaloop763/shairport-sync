@@ -85,6 +85,9 @@ Each is its own `fork/<topic>` branch.
    same pipe). Done when, on the fake Cast device, a pause produces one Cast PAUSE and a
    resume after a flush produces a re-LOAD (tests in `tests/`), and on the real Hub the pause
    lag Walter hears drops from about `lag_s` to under a second.
+   Built 2026-10-18 for `paus`, `pfls` and `pres` (`handle()` in `bridge.py`); the fake-Hub tests
+   pass, the real-Hub check is open. `pbeg`/`pend` are left to the recovery loop, which now treats
+   a Hub paused by us as healthy.
 2. **`fork/now-playing`**: title, artist, album and artwork to the Hub's screen. Serve
    artwork from our HTTP server; update metadata in place (PlayOnAir sends a `QUEUE_UPDATE`,
    `bridge/remote.rs`). Done when a track change on the iPhone changes the Hub's screen with

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import queue
+import re
 import select
 import stat
 import subprocess
@@ -29,6 +30,9 @@ lock = threading.Lock()
 volume_cond = threading.Condition()
 volume_pending = None  # newest volume command not yet applied
 cast_target = None
+paused_by_us = False  # we sent PAUSE for an AirPlay pause or flush; the recovery loop must not undo it
+needs_reload = False  # AirPlay flushed, so the Hub still holds pre-flush audio: resume with a new LOAD
+cast_lock = threading.Lock()  # the event thread and the recovery loop both LOAD; one at a time
 
 
 def map_airplay_volume(value, cap):
@@ -123,13 +127,17 @@ def discover():
         pychromecast.discovery.stop_discovery(browser)
 
 
-def feed_pcm(proc, path):
+def make_fifo(path):
     try:
         os.mkfifo(path, 0o666)
     except FileExistsError:
         if not stat.S_ISFIFO(os.stat(path).st_mode):
-            raise RuntimeError('PCM path is not a FIFO')
+            raise RuntimeError(f'{path} is not a FIFO')
     os.chmod(path, 0o666)
+
+
+def feed_pcm(proc, path):
+    make_fifo(path)
     fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
     pending = bytearray()
     stats.update(pcm_blocks=0, input_waits=0, idle_events=0,
@@ -171,6 +179,49 @@ def feed_pcm(proc, path):
             proc.stdin.flush()
             stats['inserted_silence_bytes'] += BLOCK
     raise RuntimeError('Encoder exited')
+
+
+ITEM = re.compile(rb'<item><type>([0-9a-f]+)</type><code>([0-9a-f]+)</code>')
+
+
+def read_events(path, handle):
+    """Call handle(code) for each ssnc item Shairport writes to the metadata pipe, e.g. 'paus'."""
+    make_fifo(path)
+    fd = os.open(path, os.O_RDWR)  # O_RDWR: no EOF while Shairport is between writers
+    pending = b''
+    while True:
+        pending += os.read(fd, 4096)
+        *items, pending = pending.split(b'</item>')
+        for item in items:
+            match = ITEM.search(item)
+            if match and match[1] == b'73736e63':  # 'ssnc', Shairport's own session events
+                handle(bytes.fromhex(match[2].decode()).decode('ascii', 'replace'))
+
+
+def handle(code, stream):
+    """The translation table: one AirPlay event in, Cast verbs out."""
+    global paused_by_us, needs_reload
+    if cast_target is None or code not in ('paus', 'pfls', 'pres'):
+        return
+    print('AIRPLAY_EVENT', code, flush=True)
+    try:
+        if code == 'pres':
+            paused_by_us = False
+            if needs_reload:
+                needs_reload = False
+                with cast_lock:
+                    load_stream(cast_target, stream)
+            else:
+                cast_target.media_controller.play()
+        else:
+            needs_reload = needs_reload or code == 'pfls'
+            if not paused_by_us:  # an iPhone pause sends paus then pfls: one PAUSE
+                paused_by_us = True
+                cast_target.media_controller.pause()
+    except Exception as exc:
+        # A failed LOAD or PLAY leaves the Hub not playing, which the recovery loop in main() repairs.
+        paused_by_us = False
+        print('EVENT_FAILURE', json.dumps({'code': code, 'error': repr(exc)}), flush=True)
 
 
 def broadcast(proc):
@@ -286,6 +337,8 @@ class DropWatch:
 
 
 def load_stream(cast, stream):
+    global paused_by_us
+    paused_by_us = False  # a LOAD starts playback, so any pause of ours is over
     # Preserve the user's current device volume across bridge restarts.
     cast.media_controller.launch()
     time.sleep(2)
@@ -342,8 +395,10 @@ def main():
     threading.Thread(target=volume_worker, daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    time.sleep(2)
     stream = f'http://{host}:{port}/live.mp3'
+    threading.Thread(target=read_events, args=('/audio/metadata', lambda code: handle(code, stream)),
+                     daemon=True).start()
+    time.sleep(2)
     # Walter's recovery policy: recast at once when the Hub drops our stream; when a person chose
     # something else, wait for new AirPlay audio. RECAST_ATTEMPTS tries, then wait for new audio.
     target = browser = None  # keep the Cast connection and discovery browser alive for this process
@@ -365,7 +420,8 @@ def main():
                 stats['cast']['lag_s'] = round(sent[0] / MP3_BYTES_PER_S - status.adjusted_current_time, 2)
             else:
                 stats['cast'].pop('lag_s', None)
-        if status and status.player_state in ('PLAYING', 'BUFFERING') and status.content_id == stream:
+        if status and status.content_id == stream and (status.player_state in ('PLAYING', 'BUFFERING')
+                                                       or (paused_by_us and status.player_state == 'PAUSED')):
             lost_since = wait_audio_since = None
             playing_since = playing_since or now
             if now - playing_since >= STEADY_PLAY:
@@ -397,7 +453,8 @@ def main():
                     if target is None:
                         target, browser = connect(os.environ['CAST_UUID'])
                         cast_target = target
-                    load_stream(target, stream)
+                    with cast_lock:
+                        load_stream(target, stream)
                 except Exception as exc:
                     print('RECAST_FAILURE', json.dumps({'attempt': attempts, 'error': repr(exc)}), flush=True)
                     next_try = time.monotonic() + RECAST_DELAYS[min(attempts, len(RECAST_DELAYS)) - 1]
