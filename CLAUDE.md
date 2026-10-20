@@ -41,6 +41,11 @@ The Nest Hub is in Walter's bedroom. Keep `CAST_VOLUME_CAP` at `0.5` until Walte
 `cast-bridge/tools/hook_volume_test.py` changes the device volume, so run it only when Walter
 asks. The other tools are read-only and only work on the home LAN.
 
+## Resources
+
+This PC is RAM-limited: keep total memory use under 10 GB during testing, Docker containers
+and builds included.
+
 ## Git
 
 Make one commit per logical change. The subject says what changed and the body says why; when
